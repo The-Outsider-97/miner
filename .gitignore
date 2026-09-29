@@ -52,7 +52,7 @@ benchmarks/harnyx/manifests/*.json
 *.sqlite3-shm
 *.sqlite3-wal
 
-# Frontend build output (frontend remains gated until backend validation)
+# Frontend build / dependency output
 node_modules/
 .next/
 out/

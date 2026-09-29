@@ -1,3 +1,7 @@
+import Image from "next/image";
+
+import remyMark from "./assets/remy3design-mark.png";
+
 const footerLinks = [
   { label: "TaoStats SN67", href: "https://taostats.io/subnets/67/statistics" },
   { label: "TaoMarketCap SN67", href: "https://taomarketcap.com/subnets/67" },
@@ -11,26 +15,29 @@ export function Footer() {
     <footer className="site-footer">
       <div className="site-footer__top">
         <div className="footer-brand">
-          <img src="/remy3design-mark.png" alt="" />
+          <Image src={remyMark} alt="" />
           <div>
             <strong>SLAI Miner SN67</strong>
             <span>Harnyx research-miner engineering dashboard</span>
           </div>
         </div>
 
-        <nav className="footer-links" aria-label="Network and project links">
+        <div className="footer-column">
+          <p>Network &amp; research</p>
           {footerLinks.map((link) => (
             <a key={link.href} href={link.href} target="_blank" rel="noreferrer">
               <span>{link.label}</span>
               <span aria-hidden="true">↗</span>
             </a>
           ))}
-        </nav>
+        </div>
       </div>
 
       <div className="site-footer__bottom">
         <p>© {new Date().getFullYear()} Remy3Design</p>
-        <p className="footer-note">Observability only — no wallet, registration, TAO transfer, or artifact-submission controls.</p>
+        <p className="footer-note">
+          Read-only observability. No wallet management, subnet registration, TAO transfer, or artifact submission controls.
+        </p>
       </div>
     </footer>
   );
