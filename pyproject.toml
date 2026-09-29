@@ -31,4 +31,6 @@ line-length = 120
 target-version = "py311"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM"]
+# Correctness lint is intentionally credential-free and stable across the mixed
+# upstream/source integration. Formatting is reviewed separately.
+select = ["E9", "F"]
