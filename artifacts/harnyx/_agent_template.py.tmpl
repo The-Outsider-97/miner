@@ -1,0 +1,200 @@
+from __future__ import annotations
+
+import json
+import re
+import time
+
+from harnyx_miner_sdk.api import llm_chat, search_web, tooling_info
+from harnyx_miner_sdk.context import ContextSnapshot
+from harnyx_miner_sdk.decorators import entrypoint
+from harnyx_miner_sdk.query import CitationRef, Query, Response
+from harnyx_miner_sdk.structured_output import validate_output_against_schema
+
+PROFILE = __PROFILE_JSON__
+_MARKER = re.compile(r"\[\[(\d+)\]\]")
+
+
+def _answer_prompt(query: Query, evidence: str, plan: str) -> str:
+    if query.fast:
+        instruction = "Answer every required component directly and correctly. Be concise. Add no citations or unrelated claims."
+    elif evidence:
+        instruction = "Answer as a research assistant. Ground factual claims in the supplied evidence and use only the exact [[n]] markers shown."
+    else:
+        instruction = "Answer accurately and self-contained. Do not invent citations. State material uncertainty briefly."
+    if query.output_schema is not None:
+        instruction += " Return ONLY one JSON value matching this JSON Schema exactly; no Markdown fence: " + json.dumps(query.output_schema, ensure_ascii=False, sort_keys=True)
+    parts = [instruction, "QUESTION:\n" + query.text]
+    if plan:
+        parts.append("PLANNING NOTES:\n" + plan)
+    if evidence:
+        parts.append("EVIDENCE:\n" + evidence)
+    return "\n\n".join(parts)
+
+
+def _parse_json(text: str):
+    value = text.strip()
+    if value.startswith("```"):
+        newline = value.find("\n")
+        if newline >= 0:
+            value = value[newline + 1 :]
+        if value.endswith("```"):
+            value = value[:-3]
+    return json.loads(value.strip())
+
+
+def _schema_fallback(schema):
+    if "const" in schema:
+        return schema["const"]
+    enum = schema.get("enum")
+    if isinstance(enum, list) and enum:
+        return enum[0]
+    for keyword in ("oneOf", "anyOf"):
+        variants = schema.get(keyword)
+        if isinstance(variants, list) and variants:
+            return _schema_fallback(variants[0])
+    kind = schema.get("type")
+    if isinstance(kind, list):
+        if "null" in kind:
+            return None
+        kind = kind[0] if kind else None
+    if kind == "object" or "properties" in schema:
+        properties = schema.get("properties") or {}
+        return {key: _schema_fallback(properties.get(key) or {}) for key in (schema.get("required") or [])}
+    if kind == "array":
+        return [_schema_fallback(schema.get("items") or {}) for _ in range(schema.get("minItems") or 0)]
+    if kind == "integer":
+        return int(schema.get("minimum") or 0)
+    if kind == "number":
+        return float(schema.get("minimum") or 0.0)
+    if kind == "boolean":
+        return False
+    if kind == "null":
+        return None
+    return "Unavailable"
+
+
+def _sanitize_markers(text: str, count: int) -> str:
+    def replace(match):
+        index = int(match.group(1))
+        return match.group(0) if 1 <= index <= count else ""
+    return _MARKER.sub(replace, text).strip()
+
+
+async def _route():
+    default = PROFILE["routes"][0]
+    if not PROFILE["provider_routing"]:
+        return default
+    try:
+        info = await tooling_info(timeout=5.0)
+    except Exception:
+        return default
+    allowed = info.response.get("allowed_llm_provider_models") or {}
+    for route in PROFILE["routes"]:
+        if route["model"] in (allowed.get(route["provider"]) or []):
+            return route
+    return default
+
+
+async def _chat(route, prompt: str, tokens: int, remaining: float):
+    try:
+        result = await llm_chat(
+            provider=route["provider"], model=route["model"],
+            messages=[{"role": "user", "content": prompt}], temperature=0.0,
+            max_output_tokens=tokens, timeout=PROFILE["tool_timeout_seconds"],
+        )
+    except Exception:
+        return "", remaining
+    return (result.llm.raw_text or "").strip(), result.budget.session_remaining_budget_usd
+
+
+async def _plan(query: Query, route, remaining: float):
+    if query.fast or not PROFILE["decomposition"]:
+        return "", remaining
+    prompt = "Decompose this research question into at most four factual checks. Return planning notes only, not the answer.\n\n" + query.text
+    return await _chat(route, prompt, PROFILE["analysis_max_output_tokens"], remaining)
+
+
+async def _evidence(query: Query, plan: str, remaining: float):
+    if query.fast or not PROFILE["retrieval"]:
+        return "", [], remaining
+    search_text = query.text if not plan else query.text + "\n" + plan
+    try:
+        search = await search_web(search_text, provider=PROFILE["search_provider"], num=PROFILE["search_results"], timeout=PROFILE["tool_timeout_seconds"])
+    except Exception:
+        return "", [], remaining
+    usable = [item for item in search.results if (item.note or "").strip()]
+    if PROFILE["evidence_ranking"]:
+        usable.sort(key=lambda item: (len(item.note or ""), len(item.title or "")), reverse=True)
+    selected = usable[: PROFILE["evidence_limit"]]
+    lines = []
+    citations = []
+    for index, item in enumerate(selected, start=1):
+        title = (item.title or item.url or "source").strip()
+        note = (item.note or "").strip()[:1800]
+        lines.append("SOURCE " + str(index) + " [[" + str(index) + "]] " + title + "\n" + note)
+        citations.append(CitationRef(receipt_id=search.receipt_id, result_id=item.result_id))
+    return "\n\n".join(lines), citations, search.budget.session_remaining_budget_usd
+
+
+async def _structured(query: Query, route, raw: str, remaining: float):
+    schema = query.output_schema or {}
+    try:
+        output = _parse_json(raw)
+        validate_output_against_schema(output, schema)
+        return output, remaining
+    except (json.JSONDecodeError, ValueError, TypeError):
+        repair = "Repair this candidate into exactly one JSON value matching the schema. Return JSON only.\nSCHEMA:\n" + json.dumps(schema, ensure_ascii=False, sort_keys=True) + "\nCANDIDATE:\n" + raw
+        fixed, remaining = await _chat(route, repair, PROFILE["normal_max_output_tokens"], remaining)
+        try:
+            output = _parse_json(fixed)
+            validate_output_against_schema(output, schema)
+            return output, remaining
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return _schema_fallback(schema), remaining
+
+
+async def _verify(query: Query, route, answer, evidence: str, remaining: float, started: float):
+    if query.fast or not PROFILE["verification"]:
+        return answer, remaining
+    elapsed = time.monotonic() - started
+    if remaining <= PROFILE["minimum_budget_reserve_usd"] or PROFILE["time_limit_seconds_hint"] - elapsed <= PROFILE["minimum_final_seconds"]:
+        return answer, remaining
+    if query.output_schema is not None:
+        prompt = "Check and correct the candidate against the question, evidence, and schema. Return JSON only.\nQUESTION:\n" + query.text + "\nEVIDENCE:\n" + evidence + "\nSCHEMA:\n" + json.dumps(query.output_schema, ensure_ascii=False, sort_keys=True) + "\nCANDIDATE:\n" + json.dumps(answer, ensure_ascii=False, sort_keys=True)
+    else:
+        prompt = "Correct only material factual or coverage errors using the evidence. Preserve valid [[n]] markers. Return only the corrected answer.\nQUESTION:\n" + query.text + "\nEVIDENCE:\n" + evidence + "\nCANDIDATE:\n" + str(answer)
+    checked, remaining = await _chat(route, prompt, PROFILE["verification_max_output_tokens"], remaining)
+    if not checked:
+        return answer, remaining
+    if query.output_schema is None:
+        return checked, remaining
+    try:
+        output = _parse_json(checked)
+        validate_output_against_schema(output, query.output_schema)
+        return output, remaining
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return answer, remaining
+
+
+@entrypoint("query")
+async def query(query: Query, context: ContextSnapshot) -> Response:
+    started = time.monotonic()
+    remaining = context.cost_budget.session_remaining_budget_usd
+    PROFILE["time_limit_seconds_hint"] = context.time_budget.limit_seconds
+    PROFILE["minimum_budget_reserve_usd"] = max(0.005, context.cost_budget.session_budget_usd * PROFILE["reserve_budget_fraction"])
+    route = await _route()
+    plan, remaining = await _plan(query, route, remaining)
+    evidence, citations, remaining = await _evidence(query, plan, remaining)
+    raw, remaining = await _chat(route, _answer_prompt(query, evidence, plan), PROFILE["fast_max_output_tokens"] if query.fast else PROFILE["normal_max_output_tokens"], remaining)
+    if query.output_schema is not None:
+        output, remaining = await _structured(query, route, raw, remaining)
+        output, remaining = await _verify(query, route, output, evidence, remaining, started)
+        return Response(output=output, citations=citations or None)
+    if not raw:
+        raw = "No reliable answer was produced within the available tool budget."
+    answer = _sanitize_markers(raw, len(citations))
+    answer, remaining = await _verify(query, route, answer, evidence, remaining, started)
+    answer = _sanitize_markers(str(answer), len(citations))
+    if citations and "[[" not in answer:
+        answer += "\n\nSources: " + "".join("[[" + str(i) + "]]" for i in range(1, len(citations) + 1))
+    return Response(text=answer, citations=citations or None)
