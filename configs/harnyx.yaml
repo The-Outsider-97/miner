@@ -1,1 +1,94 @@
+project:
+  name: slai-harnyx-miner
+  netuid: 67
+  results_database: benchmarks/harnyx/results/miner_benchmarks.sqlite3
 
+external:
+  slai:
+    path: external/slai
+    expected_commit: 44e3edf73fe6b12ccf036b0727d4d4ab4b8e7604
+    branch: SLAI-v.2.3
+  harnyx:
+    path: external/harnyx
+    expected_commit: a8fd4998d0aadda1e5099faeaacba9948a8de6b5
+    branch: main
+    sdk_version: 0.1.23
+
+harnyx:
+  max_agent_bytes_source: packages/commons/src/harnyx_commons/sandbox/agent_staging.py
+  local_eval:
+    executable: harnyx-miner-local-eval
+    default_mode: vs-champion
+  local_benchmark:
+    executable: harnyx-miner-local-benchmark
+    query_execution_time_limit_seconds: 300
+
+artifact:
+  llm_provider: chutes
+  llm_model: deepseek-ai/DeepSeek-V3.2-TEE
+  search_provider: desearch
+  fast_max_output_tokens: 512
+  normal_max_output_tokens: 1800
+  analysis_max_output_tokens: 700
+  verification_max_output_tokens: 900
+  search_results: 5
+  evidence_limit: 5
+  tool_timeout_seconds: 25.0
+  minimum_final_seconds: 12.0
+  reserve_budget_fraction: 0.25
+  profiles:
+    b0:
+      description: Pure Harnyx direct-model baseline with fast/normal output discipline.
+      provider_routing: false
+      decomposition: false
+      retrieval: false
+      evidence_ranking: false
+      verification: false
+    b1:
+      description: Minimal selective SLAI-derived routing policy with live Harnyx provider discovery.
+      provider_routing: true
+      decomposition: false
+      retrieval: false
+      evidence_ranking: false
+      verification: false
+    b2:
+      description: B1 plus conditional decomposition/reasoning before normal-query synthesis.
+      provider_routing: true
+      decomposition: true
+      retrieval: false
+      evidence_ranking: false
+      verification: false
+    b3:
+      description: Router plus Harnyx retrieval, deterministic evidence ranking, citations, and synthesis.
+      provider_routing: true
+      decomposition: false
+      retrieval: true
+      evidence_ranking: true
+      verification: false
+    b4:
+      description: B3 plus conditional decomposition and a budget-gated verification pass.
+      provider_routing: true
+      decomposition: true
+      retrieval: true
+      evidence_ranking: true
+      verification: true
+
+slai:
+  runtime_candidates:
+    - reasoning
+    - knowledge
+  conditionally_useful:
+    - planning
+    - quality
+    - handler
+    - observability
+    - safety
+  infrastructure:
+    - collaborative
+  offline_or_benchmark:
+    - adaptive
+    - learning
+    - language
+  harnyx_replaced_capabilities:
+    - browser
+    - reader

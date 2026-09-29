@@ -1,0 +1,8 @@
+[submodule "external/slai"]
+	path = external/slai
+	url = https://github.com/The-Outsider-97/SLAI.git
+	branch = SLAI-v.2.3
+[submodule "external/harnyx"]
+	path = external/harnyx
+	url = https://github.com/harnyx/harnyx.git
+	branch = main
