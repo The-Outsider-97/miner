@@ -18,7 +18,9 @@ import type {
 const STORAGE_KEY =
   "slai-miner-tao-currency";
 
-const REFRESH_MS = 300_000;
+// This only polls the local /api/tao bridge. The Python market service caches
+// quotes and performs an external provider request only every 3–5 minutes.
+const REFRESH_MS = 60_000;
 
 const SUPPORTED: readonly TaoCurrency[] = [
   "USD",
