@@ -19,7 +19,8 @@ def require_external_repository(name: str, sentinel: str) -> Path:
     expected = root / sentinel
     if not expected.is_file():
         raise ExternalDependencyError(
-            f"external/{name} is not initialized at the expected revision; run git submodule update --init --recursive",
+            f"external/{name} is not initialized at the expected revision; "
+            "run git submodule update --init --recursive",
             context={"repository": name, "expected_file": str(expected)},
         )
     return root
@@ -31,20 +32,45 @@ def prepend_import_path(path: Path) -> None:
         sys.path.insert(0, value)
 
 
-def git_head(path: Path) -> str:
-    completed = subprocess.run(
-        ["git", "-C", str(path), "rev-parse", "HEAD"],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
+def _run_git(path: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(path), *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except FileNotFoundError as exc:
+        raise ExternalDependencyError(
+            "git executable was not found",
+            context={"path": str(path)},
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise ExternalDependencyError(
+            "git command timed out",
+            context={"path": str(path), "arguments": list(args)},
+        ) from exc
     if completed.returncode != 0:
         raise ExternalDependencyError(
-            "unable to resolve git revision",
-            context={"path": str(path), "stderr": completed.stderr.strip()[-500:]},
+            "git command failed",
+            context={
+                "path": str(path),
+                "arguments": list(args),
+                "returncode": completed.returncode,
+                "stderr": completed.stderr.strip()[-500:],
+            },
         )
-    return completed.stdout.strip()
+    return completed
+
+
+def git_head(path: Path) -> str:
+    return _run_git(path, "rev-parse", "HEAD").stdout.strip()
+
+
+def git_is_clean(path: Path) -> bool:
+    completed = _run_git(path, "status", "--porcelain", "--untracked-files=no")
+    return not completed.stdout.strip()
 
 
 def run_checked(
