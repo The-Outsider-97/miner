@@ -147,7 +147,7 @@ html[data-theme="light"] .dashboard-section--surface .component-state, html[data
 .integration-card__head { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 20px; }
 .status-label { display: inline-flex; align-items: center; gap: 9px; color: var(--muted); font: 10px var(--font-mono); white-space: nowrap; }
 .subsection { margin-top: 46px; }
-.subsection__heading { display: flex; align-items: end; justify-content: space-between; gap: 24px; margin-bottom: 18px; }
+.subsection__heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; margin-bottom: 18px; }
 .empty-state, .table-empty { padding: 34px; border: 1px solid var(--line); background: var(--bg); color: var(--muted); line-height: 1.65; }
 .table-scroll { width: 100%; overflow-x: auto; border-top: 1px solid var(--line); }
 .data-table { width: 100%; min-width: 760px; border-collapse: collapse; font-size: 13px; }
