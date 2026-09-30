@@ -37,10 +37,10 @@ jobs:
           fi
 
       - name: Lint backend
-        run: uv run ruff check artifact_builder.py benchmark_store.py dashboard_api.py slai_miner.py adapters utils tests
+        run: uv run ruff check artifact_builder.py benchmark_store.py dashboard_api.py tao_state_api.py slai_miner.py adapters services utils tests
 
       - name: Compile backend and artifacts
-        run: uv run python -m compileall -q artifact_builder.py benchmark_store.py dashboard_api.py slai_miner.py adapters utils artifacts/harnyx tests
+        run: uv run python -m compileall -q artifact_builder.py benchmark_store.py dashboard_api.py tao_state_api.py slai_miner.py adapters services utils artifacts/harnyx tests
 
       - name: Run credential-free tests
         run: uv run pytest -q -m "not integration and not harnyx"
