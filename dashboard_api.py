@@ -5,10 +5,22 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
+import os
+
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
+from pathlib import Path
+
+MINER_ROOT = Path(__file__).resolve().parent
+SLAI_ROOT = MINER_ROOT.parent
+
+SLAI_MINER_PATH = Path(
+    os.environ.get(
+        "SLAI_MINER_PATH",
+        SLAI_ROOT / "slai_miner.py",
+    )
+).resolve()
 
 from benchmark_store import BenchmarkStore
 from utils.config_loader import get_config_section, load_config
