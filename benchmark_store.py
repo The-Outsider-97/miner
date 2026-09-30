@@ -12,13 +12,14 @@ import math
 import sqlite3
 import statistics
 import uuid
+
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from utils.miner_errors import BenchmarkExecutionError
+from .utils.miner_errors import BenchmarkExecutionError
 
 
 @dataclass(frozen=True, slots=True)

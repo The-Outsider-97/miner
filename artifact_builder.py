@@ -8,15 +8,16 @@ import hashlib
 import json
 import pprint
 import re
+
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from utils.config_loader import get_config_section, load_config
-from utils.miner_errors import ArtifactBuildError, ArtifactValidationError
-from utils.miner_helpers import PROJECT_ROOT, git_head, require_external_repository, run_checked
+from .utils.config_loader import get_config_section, load_config
+from .utils.miner_errors import ArtifactBuildError, ArtifactValidationError
+from .utils.miner_helpers import PROJECT_ROOT, git_head, require_external_repository, run_checked
 
 _ARTIFACT_ROOT = PROJECT_ROOT / "artifacts" / "harnyx"
 _TEMPLATE = _ARTIFACT_ROOT / "_agent_template.py.tmpl"

@@ -22,11 +22,11 @@ SLAI_MINER_PATH = Path(
     )
 ).resolve()
 
-from benchmark_store import BenchmarkStore
-from utils.config_loader import get_config_section, load_config
-from utils.miner_errors import MinerError
-from utils.miner_helpers import PROJECT_ROOT
-from utils.repository_state import benchmark_database_path, dependency_status
+from .benchmark_store import BenchmarkStore
+from .utils.config_loader import get_config_section, load_config
+from .utils.miner_errors import MinerError
+from .utils.miner_helpers import PROJECT_ROOT
+from .utils.repository_state import benchmark_database_path, dependency_status
 
 _COMPONENTS = (
     "provider_routing",

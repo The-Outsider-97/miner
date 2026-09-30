@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import re
+
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from utils.miner_errors import CitationValidationError, HarnyxProtocolError, StructuredOutputError
-from utils.miner_helpers import prepend_import_path, require_external_repository
+from ..utils.miner_errors import CitationValidationError, HarnyxProtocolError, StructuredOutputError
+from ..utils.miner_helpers import prepend_import_path, require_external_repository
 
 _HARNYX_ROOT = require_external_repository("harnyx", "packages/miner-sdk/src/harnyx_miner_sdk/query.py")
 prepend_import_path(_HARNYX_ROOT / "packages" / "miner-sdk" / "src")

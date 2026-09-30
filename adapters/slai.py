@@ -9,11 +9,12 @@ before its strategy is distilled into a standalone artifact.
 from __future__ import annotations
 
 import time
+
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
-from utils.miner_errors import SLAIIntegrationError
-from utils.miner_helpers import prepend_import_path, require_external_repository
+from ..utils.miner_errors import SLAIIntegrationError
+from ..utils.miner_helpers import prepend_import_path, require_external_repository
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,9 +31,9 @@ class SlaiRuntime:
         slai_root = require_external_repository("slai", "src/agents/agent_factory.py")
         prepend_import_path(slai_root)
 
-        from logs.logger import get_logger
-        from src.agents.agent_factory import AgentFactory
-        from src.agents.collaborative.shared_memory import SharedMemory
+        from logs.logger import get_logger # type: ignore
+        from src.agents.agent_factory import AgentFactory # type: ignore
+        from src.agents.collaborative.shared_memory import SharedMemory # type: ignore
 
         self._logger = get_logger("Miner SLAI Adapter")
         started = time.perf_counter()
