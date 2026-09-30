@@ -292,7 +292,7 @@ def _parser() -> argparse.ArgumentParser:
     smoke.add_argument("--reason")
     smoke.add_argument("--retrieve")
 
-    evaluate = commmands.add_parser("eval")
+    evaluate = commands.add_parser("eval")
     evaluate.add_argument("--artifact", required=True)
     evaluate.add_argument("--strategy", required=True)
     evaluate.add_argument("--batch-id")
