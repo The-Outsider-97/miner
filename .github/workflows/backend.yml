@@ -30,19 +30,23 @@ jobs:
       - name: Verify no tracked secret material
         shell: bash
         run: |
-          if git ls-files | grep -E '(^|/)(\.env|wallets/|credentials/|secrets/)|\.(pem|p12|pfx)$'; then
+          tracked="$(git ls-files | grep -vE '(^|/)\.env\.example$' || true)"
+          if printf '%s\n' "$tracked" | grep -E '(^|/)\.env($|\.)|(^|/)(wallets|credentials|secrets)/|\.(pem|key|p12|pfx)$'; then
             echo "Tracked credential-like file detected"
             exit 1
           fi
 
       - name: Lint backend
-        run: uv run ruff check artifact_builder.py benchmark_store.py slai_miner.py adapters utils tests
+        run: uv run ruff check artifact_builder.py benchmark_store.py dashboard_api.py slai_miner.py adapters utils tests
 
       - name: Compile backend and artifacts
-        run: uv run python -m compileall -q artifact_builder.py benchmark_store.py slai_miner.py adapters utils artifacts/harnyx tests
+        run: uv run python -m compileall -q artifact_builder.py benchmark_store.py dashboard_api.py slai_miner.py adapters utils artifacts/harnyx tests
 
       - name: Run credential-free tests
         run: uv run pytest -q -m "not integration and not harnyx"
+
+      - name: Smoke dashboard bridge
+        run: uv run python dashboard_api.py --json
 
       - name: Exercise deterministic artifact builder
         shell: bash

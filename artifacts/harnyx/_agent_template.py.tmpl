@@ -153,11 +153,23 @@ async def _structured(query: Query, route, raw: str, remaining: float):
             return _schema_fallback(schema), remaining
 
 
-async def _verify(query: Query, route, answer, evidence: str, remaining: float, started: float):
+async def _verify(
+    query: Query,
+    route,
+    answer,
+    evidence: str,
+    remaining: float,
+    started: float,
+    time_limit_seconds: float,
+    minimum_budget_reserve_usd: float,
+):
     if query.fast or not PROFILE["verification"]:
         return answer, remaining
     elapsed = time.monotonic() - started
-    if remaining <= PROFILE["minimum_budget_reserve_usd"] or PROFILE["time_limit_seconds_hint"] - elapsed <= PROFILE["minimum_final_seconds"]:
+    if (
+        remaining <= minimum_budget_reserve_usd
+        or time_limit_seconds - elapsed <= PROFILE["minimum_final_seconds"]
+    ):
         return answer, remaining
     if query.output_schema is not None:
         prompt = "Check and correct the candidate against the question, evidence, and schema. Return JSON only.\nQUESTION:\n" + query.text + "\nEVIDENCE:\n" + evidence + "\nSCHEMA:\n" + json.dumps(query.output_schema, ensure_ascii=False, sort_keys=True) + "\nCANDIDATE:\n" + json.dumps(answer, ensure_ascii=False, sort_keys=True)
@@ -180,20 +192,41 @@ async def _verify(query: Query, route, answer, evidence: str, remaining: float, 
 async def query(query: Query, context: ContextSnapshot) -> Response:
     started = time.monotonic()
     remaining = context.cost_budget.session_remaining_budget_usd
-    PROFILE["time_limit_seconds_hint"] = context.time_budget.limit_seconds
-    PROFILE["minimum_budget_reserve_usd"] = max(0.005, context.cost_budget.session_budget_usd * PROFILE["reserve_budget_fraction"])
+    time_limit_seconds = context.time_budget.limit_seconds
+    minimum_budget_reserve_usd = max(
+        0.005,
+        context.cost_budget.session_budget_usd * PROFILE["reserve_budget_fraction"],
+    )
     route = await _route()
     plan, remaining = await _plan(query, route, remaining)
     evidence, citations, remaining = await _evidence(query, plan, remaining)
     raw, remaining = await _chat(route, _answer_prompt(query, evidence, plan), PROFILE["fast_max_output_tokens"] if query.fast else PROFILE["normal_max_output_tokens"], remaining)
     if query.output_schema is not None:
         output, remaining = await _structured(query, route, raw, remaining)
-        output, remaining = await _verify(query, route, output, evidence, remaining, started)
+        output, remaining = await _verify(
+            query,
+            route,
+            output,
+            evidence,
+            remaining,
+            started,
+            time_limit_seconds,
+            minimum_budget_reserve_usd,
+        )
         return Response(output=output, citations=citations or None)
     if not raw:
         raw = "No reliable answer was produced within the available tool budget."
     answer = _sanitize_markers(raw, len(citations))
-    answer, remaining = await _verify(query, route, answer, evidence, remaining, started)
+    answer, remaining = await _verify(
+        query,
+        route,
+        answer,
+        evidence,
+        remaining,
+        started,
+        time_limit_seconds,
+        minimum_budget_reserve_usd,
+    )
     answer = _sanitize_markers(str(answer), len(citations))
     if citations and "[[" not in answer:
         answer += "\n\nSources: " + "".join("[[" + str(i) + "]]" for i in range(1, len(citations) + 1))

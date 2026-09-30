@@ -8,57 +8,33 @@ from __future__ import annotations
 import argparse
 import json
 import uuid
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from artifact_builder import build_all, build_artifact
 from benchmark_store import BenchmarkStore
-from utils.config_loader import get_config_section, load_config
-from utils.miner_errors import MinerError
-from utils.miner_helpers import PROJECT_ROOT, git_head, require_external_repository, run_checked
+from utils.config_loader import get_config_section
+from utils.miner_errors import BenchmarkExecutionError, MinerConfigurationError, MinerError
+from utils.miner_helpers import PROJECT_ROOT, require_external_repository, run_checked
+from utils.repository_state import (
+    benchmark_database_path,
+    dependency_status,
+    repository_commits,
+)
 
-
-def _commits() -> dict[str, str]:
-    slai = require_external_repository("slai", "src/agents/agent_factory.py")
-    harnyx = require_external_repository("harnyx", "packages/miner-sdk/pyproject.toml")
-    return {
-        "miner": git_head(PROJECT_ROOT),
-        "slai": git_head(slai),
-        "harnyx": git_head(harnyx),
-    }
-
-
-def dependency_status() -> dict[str, Any]:
-    config = load_config()
-    external = get_config_section("external", config=config)
-    result = {}
-    for name, sentinel in (
-        ("slai", "src/agents/agent_factory.py"),
-        ("harnyx", "packages/miner-sdk/pyproject.toml"),
-    ):
-        root = require_external_repository(name, sentinel)
-        expected = str((external.get(name) or {}).get("expected_commit", ""))
-        actual = git_head(root)
-        result[name] = {
-            "path": str(root.relative_to(PROJECT_ROOT)),
-            "expected_commit": expected,
-            "actual_commit": actual,
-            "pinned": bool(expected and expected == actual),
-        }
-    result["miner"] = {"actual_commit": git_head(PROJECT_ROOT)}
-    return result
+_ARTIFACT_COMPONENTS = (
+    "provider_routing",
+    "decomposition",
+    "retrieval",
+    "evidence_ranking",
+    "verification",
+)
 
 
 def _store() -> BenchmarkStore:
-    project = get_config_section("project")
-    database = str(
-        project.get(
-            "results_database",
-            "benchmarks/harnyx/results/miner_benchmarks.sqlite3",
-        )
-    )
-    return BenchmarkStore(PROJECT_ROOT / database)
+    return BenchmarkStore(benchmark_database_path())
 
 
 def _output_dir(label: str) -> Path:
@@ -90,7 +66,60 @@ def _summary(stdout: str) -> dict[str, Any]:
             continue
         if isinstance(value, dict):
             return value
-    raise MinerError("official Harnyx command did not emit a machine-readable JSON summary")
+    raise BenchmarkExecutionError(
+        "official Harnyx command did not emit a machine-readable JSON summary"
+    )
+
+
+def _harnyx_command_settings(name: str) -> Mapping[str, Any]:
+    harnyx = get_config_section("harnyx")
+    settings = harnyx.get(name) or {}
+    if not isinstance(settings, Mapping):
+        raise MinerConfigurationError(
+            f"harnyx.{name} must be a mapping",
+            context={"actual_type": type(settings).__name__},
+        )
+    return settings
+
+
+def _required_text_setting(
+    settings: Mapping[str, Any],
+    key: str,
+    *,
+    section: str,
+) -> str:
+    value = str(settings.get(key) or "").strip()
+    if not value:
+        raise MinerConfigurationError(f"{section}.{key} must be configured")
+    return value
+
+
+def _report_path(
+    summary: Mapping[str, Any],
+    *,
+    key: str,
+    output_dir: Path,
+) -> Path:
+    raw = summary.get(key)
+    if not isinstance(raw, str) or not raw.strip():
+        raise BenchmarkExecutionError(
+            "official Harnyx summary is missing the report path",
+            context={"field": key},
+        )
+    candidate = Path(raw).expanduser()
+    path = candidate.resolve() if candidate.is_absolute() else (output_dir / candidate).resolve()
+    output = output_dir.resolve()
+    if path != output and output not in path.parents:
+        raise BenchmarkExecutionError(
+            "official Harnyx report path escaped the requested output directory",
+            context={"field": key, "path": str(path), "output_dir": str(output)},
+        )
+    if not path.is_file():
+        raise BenchmarkExecutionError(
+            "official Harnyx report file does not exist",
+            context={"field": key, "path": str(path)},
+        )
+    return path
 
 
 def local_eval(
@@ -99,10 +128,23 @@ def local_eval(
     strategy: str,
     batch_id: str | None = None,
     task_id: str | None = None,
-    mode: str = "vs-champion",
+    mode: str | None = None,
     disabled_components: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     harnyx = require_external_repository("harnyx", "miner/src/harnyx_miner/local_eval.py")
+    settings = _harnyx_command_settings("local_eval")
+    executable = _required_text_setting(settings, "executable", section="harnyx.local_eval")
+    selected_mode = mode or _required_text_setting(
+        settings,
+        "default_mode",
+        section="harnyx.local_eval",
+    )
+    if selected_mode not in {"vs-champion", "target-only"}:
+        raise MinerConfigurationError(
+            "harnyx.local_eval.default_mode is unsupported",
+            context={"mode": selected_mode},
+        )
+
     output = _output_dir(f"{strategy}-local-eval")
     command = [
         "uv",
@@ -110,11 +152,11 @@ def local_eval(
         "--frozen",
         "--package",
         "harnyx-miner",
-        "harnyx-miner-local-eval",
+        executable,
         "--agent-path",
         str(artifact.resolve()),
         "--mode",
-        mode,
+        selected_mode,
         "--output-dir",
         str(output),
     ]
@@ -125,13 +167,13 @@ def local_eval(
 
     completed = run_checked(command, cwd=harnyx, timeout=None)
     summary = _summary(completed.stdout)
-    report = Path(str(summary["json_report"])).resolve()
+    report = _report_path(summary, key="json_report", output_dir=output)
     with _store() as store:
         run_id = store.ingest_report(
             report,
             strategy=strategy,
             artifact_version=strategy,
-            commits=_commits(),
+            commits=repository_commits(),
             ablation={"disabled_components": list(disabled_components)},
             slai_config=get_config_section("slai"),
         )
@@ -157,15 +199,31 @@ def local_benchmark(
         "harnyx",
         "miner/src/harnyx_miner/local_benchmark.py",
     )
+    settings = _harnyx_command_settings("local_benchmark")
+    executable = _required_text_setting(
+        settings,
+        "executable",
+        section="harnyx.local_benchmark",
+    )
+    try:
+        query_limit = float(settings["query_execution_time_limit_seconds"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise MinerConfigurationError(
+            "harnyx.local_benchmark.query_execution_time_limit_seconds must be numeric"
+        ) from exc
+    if query_limit <= 0:
+        raise MinerConfigurationError(
+            "harnyx.local_benchmark.query_execution_time_limit_seconds must be > 0"
+        )
+
     output = _output_dir(f"{strategy}-{suite}")
-    settings = get_config_section("harnyx").get("local_benchmark") or {}
     command = [
         "uv",
         "run",
         "--frozen",
         "--package",
         "harnyx-miner",
-        "harnyx-miner-local-benchmark",
+        executable,
         "--suite",
         suite,
         "--agent-path",
@@ -173,7 +231,7 @@ def local_benchmark(
         "--source-batch-id",
         source_batch_id,
         "--query-execution-time-limit-seconds",
-        str(settings.get("query_execution_time_limit_seconds", 300)),
+        str(query_limit),
         "--output-dir",
         str(output),
     ]
@@ -184,13 +242,13 @@ def local_benchmark(
 
     completed = run_checked(command, cwd=harnyx, timeout=None)
     summary = _summary(completed.stdout)
-    report = Path(str(summary["json_report"])).resolve()
+    report = _report_path(summary, key="json_report", output_dir=output)
     with _store() as store:
         run_id = store.ingest_report(
             report,
             strategy=strategy,
             artifact_version=strategy,
-            commits=_commits(),
+            commits=repository_commits(),
             ablation={"disabled_components": list(disabled_components)},
             slai_config=get_config_section("slai"),
         )
@@ -207,16 +265,8 @@ def _add_ablation_arguments(parser: argparse.ArgumentParser) -> None:
         "--ablation",
         action="append",
         default=[],
-        choices=[
-            "provider_routing",
-            "decomposition",
-            "retrieval",
-            "evidence_ranking",
-            "verification",
-            "caching",
-            "benchmark_memory",
-        ],
-        help="Record disabled component metadata with the benchmark run.",
+        choices=sorted(_ARTIFACT_COMPONENTS),
+        help="Record an actually disabled artifact component with the benchmark run.",
     )
 
 
@@ -234,13 +284,7 @@ def _parser() -> argparse.ArgumentParser:
         "--disable",
         action="append",
         default=[],
-        choices=[
-            "provider_routing",
-            "decomposition",
-            "retrieval",
-            "evidence_ranking",
-            "verification",
-        ],
+        choices=sorted(_ARTIFACT_COMPONENTS),
     )
 
     smoke = commands.add_parser("slai-smoke")
@@ -248,7 +292,7 @@ def _parser() -> argparse.ArgumentParser:
     smoke.add_argument("--reason")
     smoke.add_argument("--retrieve")
 
-    evaluate = commands.add_parser("eval")
+    evaluate = commmands.add_parser("eval")
     evaluate.add_argument("--artifact", required=True)
     evaluate.add_argument("--strategy", required=True)
     evaluate.add_argument("--batch-id")
@@ -256,7 +300,8 @@ def _parser() -> argparse.ArgumentParser:
     evaluate.add_argument(
         "--mode",
         choices=["vs-champion", "target-only"],
-        default="vs-champion",
+        default=None,
+        help="Defaults to configs/harnyx.yaml harnyx.local_eval.default_mode.",
     )
     _add_ablation_arguments(evaluate)
 

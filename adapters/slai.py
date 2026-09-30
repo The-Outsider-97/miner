@@ -1,9 +1,9 @@
 """Full-development-runtime bridge from Miner to the pinned SLAI v2.3 source.
 
-Nothing in this module is exported into the Harnyx validator artifact.  It owns
-one SLAI SharedMemory instance and one AgentFactory, creates only requested
-agents, and exposes timing so an agent's overhead can be measured before its
-strategy is distilled into a standalone artifact.
+Nothing in this module is exported into the Harnyx validator artifact. It uses
+SLAI's process-scoped SharedMemory singleton and one AgentFactory, creates only
+requested agents, and exposes timing so an agent's overhead can be measured
+before its strategy is distilled into a standalone artifact.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ class AgentMeasurement:
 
 
 class SlaiRuntime:
-    """Own the canonical SLAI AgentFactory/SharedMemory lifecycle for Miner."""
+    """Own one AgentFactory lifecycle over SLAI's process-scoped SharedMemory."""
 
     def __init__(self, agents: Sequence[str] = ()) -> None:
         slai_root = require_external_repository("slai", "src/agents/agent_factory.py")
@@ -45,19 +45,29 @@ class SlaiRuntime:
         for name in agents:
             self.get_agent(name)
 
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise SLAIIntegrationError("SLAI runtime is already closed")
+
     def get_agent(self, name: str) -> Any:
+        self._ensure_open()
         key = str(name).strip().lower()
         if not key:
             raise SLAIIntegrationError("SLAI agent name must not be blank")
         existing = self._agents.get(key)
         if existing is not None:
             return existing
+
         started = time.perf_counter()
         agent = self.factory.create(key, shared_memory=self.shared_memory)
         elapsed = (time.perf_counter() - started) * 1000.0
         self._agents[key] = agent
         self.measurements.append(AgentMeasurement(key, "initialize", elapsed))
-        self._logger.info("MINER | SLAI agent initialized | agent=%s | elapsed_ms=%.3f", key, elapsed)
+        self._logger.info(
+            "MINER | SLAI agent initialized | agent=%s | elapsed_ms=%.3f",
+            key,
+            elapsed,
+        )
         return agent
 
     def reason(
@@ -103,7 +113,11 @@ class SlaiRuntime:
             "initialization_ms": self.initialization_ms,
             "agents": sorted(self._agents),
             "measurements": [
-                {"agent": item.agent, "operation": item.operation, "elapsed_ms": item.elapsed_ms}
+                {
+                    "agent": item.agent,
+                    "operation": item.operation,
+                    "elapsed_ms": item.elapsed_ms,
+                }
                 for item in self.measurements
             ],
         }
@@ -115,9 +129,14 @@ class SlaiRuntime:
         try:
             self.factory.shutdown()
         finally:
-            self.shared_memory.close()
+            # SharedMemory is a process singleton in SLAI. Closing it would poison
+            # subsequent Miner experiments in the same process because SLAI does
+            # not reinitialize a closed singleton. Clear experiment values instead;
+            # the process-scoped cleaner is released when the process exits.
+            self.shared_memory.clear_all()
 
     def __enter__(self) -> "SlaiRuntime":
+        self._ensure_open()
         return self
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:

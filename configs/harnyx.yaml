@@ -74,21 +74,36 @@ artifact:
       verification: true
 
 slai:
+  # These are the only current Miner hot-path experiment candidates exposed by
+  # adapters/slai.py. Presence here never means an agent is automatically used.
   runtime_candidates:
     - reasoning
     - knowledge
-  conditionally_useful:
-    - planning
-    - quality
+
+  benchmark_or_offline:
+    - adaptive
+    - evaluation
     - handler
+    - language
+    - learning
     - observability
+    - planning
+    - privacy
+    - quality
     - safety
+    - verification
+
+  not_justified:
+    - alignment
+    - browser
+    - execution
+    - network
+    - perception
+    - qnn
+    - reader
+    - simulation
+
+  # Collaborative is a SLAI subsystem/SharedMemory boundary, not a registered
+  # default AgentFactory agent at the pinned SLAI commit.
   infrastructure:
     - collaborative
-  offline_or_benchmark:
-    - adaptive
-    - learning
-    - language
-  harnyx_replaced_capabilities:
-    - browser
-    - reader

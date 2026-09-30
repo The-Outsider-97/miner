@@ -1,7 +1,10 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from benchmark_store import BenchmarkStore
+from utils.miner_errors import BenchmarkExecutionError
 
 
 def _report():
@@ -45,7 +48,7 @@ def _report():
                 "target": {
                     "score": 0.6,
                     "elapsed_ms": 300.0,
-                    "error": {"code": "citation_validation_failed"},
+                    "error": {"code": "miner_response_invalid", "message": "citation validation failed"},
                     "cost_and_usage": {
                         "cost_totals": {
                             "total_cost_usd": 0.02,
@@ -58,6 +61,53 @@ def _report():
                     },
                 },
             },
+        ],
+    }
+
+
+def _benchmark_report():
+    return {
+        "benchmark_metadata": {
+            "manifest": {
+                "suite_slug": "suite",
+                "dataset_version": "v1",
+                "scoring_version": "correctness-v1",
+            }
+        },
+        "identifiers": {
+            "source_batch_id": "source-batch",
+            "target_artifact_id": "artifact-b",
+        },
+        "artifacts": {
+            "target": {
+                "artifact_id": "artifact-b",
+                "sha256": "b" * 64,
+            }
+        },
+        "summary": {
+            "item_count": 1,
+            "completed_item_count": 1,
+            "failed_item_count": 0,
+            "mean_total_score": 0.75,
+            "error_count": 0,
+        },
+        "items": [
+            {
+                "task_id": "bench-1",
+                "score": 0.75,
+                "error": None,
+                "invocation": {
+                    "elapsed_ms": 250.0,
+                    "error": None,
+                    "cost_totals": {
+                        "total_cost_usd": 0.015,
+                        "llm_call_count": 1,
+                        "search_tool_call_count": 0,
+                        "embedding_call_count": 0,
+                    },
+                    "token_usage": {"total_tokens": 150},
+                },
+            }
         ],
     }
 
@@ -105,3 +155,47 @@ def test_same_harnyx_batch_can_store_multiple_candidate_runs(tmp_path: Path):
     assert first != second
     assert len(runs) == 2
     assert {run.strategy for run in runs} == {"b0", "b3"}
+
+
+def test_read_only_store_returns_normalized_run_details(tmp_path: Path):
+    path = tmp_path / "report.json"
+    path.write_text(json.dumps(_report()), encoding="utf-8")
+    database = tmp_path / "bench.sqlite3"
+    with BenchmarkStore(database) as store:
+        run_id = store.ingest_report(
+            path,
+            strategy="b3",
+            artifact_version="b3",
+            commits={"miner": "m", "slai": "s", "harnyx": "h"},
+            ablation={"disabled_components": ["verification"]},
+        )
+
+    with BenchmarkStore(database, read_only=True) as store:
+        details = store.recent_run_details(limit=5)
+        assert details[0]["run_id"] == run_id
+        assert details[0]["ablation"]["disabled_components"] == ["verification"]
+        assert details[0]["tasks"][0]["provider_model"] == {"chutes": {"m": 1}}
+        with pytest.raises(BenchmarkExecutionError):
+            store.ingest_report(
+                path,
+                strategy="b3",
+                artifact_version="b3",
+                commits={"miner": "m", "slai": "s", "harnyx": "h"},
+            )
+
+
+def test_local_benchmark_score_is_not_mislabeled_as_pairwise_comparison(tmp_path: Path):
+    path = tmp_path / "benchmark.json"
+    path.write_text(json.dumps(_benchmark_report()), encoding="utf-8")
+    database = tmp_path / "bench.sqlite3"
+    with BenchmarkStore(database) as store:
+        store.ingest_report(
+            path,
+            strategy="b3",
+            artifact_version="b3",
+            commits={"miner": "m", "slai": "s", "harnyx": "h"},
+        )
+        details = store.recent_run_details(limit=1)[0]
+    assert details["run_kind"] == "local_benchmark"
+    assert details["total_score"] == 0.75
+    assert details["comparison_score"] is None
