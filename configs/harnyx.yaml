@@ -3,6 +3,27 @@ project:
   netuid: 67
   results_database: benchmarks/harnyx/results/miner_benchmarks.sqlite3
 
+market:
+  provider: coingecko
+  coin_id: bittensor
+  currencies:
+    - USD
+    - EUR
+    - GBP
+    - BTC
+  api_base_url: https://api.coingecko.com/api/v3 # or https://freecryptoapi.com/ | https://console.apibricks.io/ | https://app.cryptoapis.io/
+  api_key_env: COINGECKO_API_KEY # or FREE_CRYPTO_API | CRYPTO_APIS_KEY | COIN_API_KEY
+
+  cache_seconds: 300
+  request_timeout_seconds: 10.0
+  cache_path: state/tao_market_cache.json
+
+submission:
+  platform_base_url_env: PLATFORM_BASE_URL
+  wallet_name_env: HARNYX_WALLET_NAME
+  hotkey_name_env: HARNYX_HOTKEY_NAME
+  ledger_path: state/submissions.sqlite3
+
 external:
   slai:
     path: external/slai

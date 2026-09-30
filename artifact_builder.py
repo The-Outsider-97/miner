@@ -218,6 +218,11 @@ def official_validate_artifact(path: str | Path) -> str:
     return digest
 
 
+def harnyx_max_agent_bytes() -> int:
+    """Return the active Harnyx artifact byte limit from pinned source."""
+    return _max_agent_bytes()
+
+
 def _baseline_source() -> str:
     try:
         return _BASELINE.read_text(encoding="utf-8")

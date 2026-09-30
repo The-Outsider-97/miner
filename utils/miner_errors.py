@@ -70,3 +70,19 @@ class BenchmarkExecutionError(MinerError):
 
 class SLAIIntegrationError(MinerError):
     code = "MIN-1700"
+
+
+class SubmissionError(MinerError):
+    code = "MIN-1800"
+
+
+class SubmissionPreflightError(SubmissionError):
+    code = "MIN-1801"
+
+
+class SubmissionRejectedError(SubmissionError):
+    code = "MIN-1802"
+
+
+class SubmissionConflictError(SubmissionError):
+    code = "MIN-1803"
