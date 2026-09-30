@@ -4,17 +4,28 @@ project:
   results_database: benchmarks/harnyx/results/miner_benchmarks.sqlite3
 
 market:
-  provider: coingecko
-  coin_id: bittensor
+  asset_symbol: TAO
   currencies:
     - USD
     - EUR
     - GBP
     - BTC
-  api_base_url: https://api.coingecko.com/api/v3 # or https://freecryptoapi.com/ | https://console.apibricks.io/ | https://app.cryptoapis.io/
-  api_key_env: COINGECKO_API_KEY # or FREE_CRYPTO_API | CRYPTO_APIS_KEY | COIN_API_KEY
 
-  cache_seconds: 300
+  # Providers are used round-robin. The next provider and next refresh time are
+  # persisted in state/tao_market_cache.json so restarts do not reset rotation.
+  providers:
+    - name: cryptoapis
+      api_base_url: https://rest.cryptoapis.io
+      api_key_env: CRYPTO_APIS_KEY
+    - name: freecryptoapi
+      api_base_url: https://api.freecryptoapi.com/v1
+      api_key_env: FREE_CRYPTO_API
+    - name: coinapi
+      api_base_url: https://rest.coinapi.io
+      api_key_env: COIN_API_KEY
+
+  refresh_min_seconds: 180
+  refresh_max_seconds: 300
   request_timeout_seconds: 10.0
   cache_path: state/tao_market_cache.json
 
