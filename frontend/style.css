@@ -170,6 +170,383 @@ html[data-theme="light"] .dashboard-section--surface .component-state, html[data
 .route-loader__orb img { width: 38px; height: 38px; object-fit: contain; }
 @keyframes orbit { to { transform: rotate(360deg); } }
 
+/* TAO market state */
+
+.tao-price {
+  min-width: 218px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas:
+    "value selector"
+    "source stale";
+  align-items: center;
+  column-gap: 10px;
+  row-gap: 2px;
+  padding: 7px 12px;
+  border-left: 1px solid var(--line);
+  border-right: 1px solid var(--line);
+}
+
+.tao-price__value {
+  grid-area: value;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.tao-price__unit {
+  color: var(--muted);
+  font: 500 9px var(--font-mono);
+  white-space: nowrap;
+}
+
+.tao-price__value strong {
+  overflow: hidden;
+  color: var(--text);
+  font: 600 12px var(--font-mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tao-price__selector {
+  grid-area: selector;
+}
+
+.tao-price select,
+.miner-earnings select,
+.submission-select select {
+  border: 1px solid var(--line);
+  border-radius: 0;
+  background: var(--surface);
+  color: var(--text);
+  font: 600 10px var(--font-mono);
+}
+
+.tao-price select {
+  padding: 4px 5px;
+}
+
+.tao-price__source {
+  grid-area: source;
+  width: max-content;
+  color: var(--muted);
+  font: 8px var(--font-mono);
+}
+
+.tao-price__source:hover {
+  color: var(--bimap-yellow);
+}
+
+.tao-price__stale {
+  grid-area: stale;
+  justify-self: end;
+  color: var(--warning);
+  font: 8px var(--font-mono);
+  text-transform: uppercase;
+}
+
+/* Sidebar earnings */
+
+.miner-earnings {
+  margin-top: 22px;
+  padding-top: 20px;
+  border-top: 1px solid var(--line);
+}
+
+.miner-earnings__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.miner-earnings__head .side-panel__label {
+  margin-bottom: 0;
+}
+
+.miner-earnings select {
+  padding: 4px 5px;
+}
+
+.miner-earnings__tao {
+  display: block;
+  margin-top: 14px;
+  overflow-wrap: anywhere;
+  font: 600 17px var(--font-mono);
+}
+
+.miner-earnings__quote {
+  display: block;
+  margin-top: 5px;
+  color: var(--muted);
+  font: 10px var(--font-mono);
+}
+
+.miner-earnings__unavailable {
+  margin: 14px 0 0;
+  color: var(--muted);
+  font: 10px/1.5 var(--font-mono);
+}
+
+/* Artifact submission */
+
+.artifact-submission {
+  margin-top: 48px;
+  padding-top: 34px;
+  border-top: 1px solid var(--line);
+}
+
+.submission-layout {
+  display: grid;
+  grid-template-columns:
+    minmax(220px, 0.7fr)
+    minmax(0, 1.3fr)
+    auto;
+  align-items: end;
+  gap: 24px;
+}
+
+.submission-select {
+  display: grid;
+  gap: 8px;
+}
+
+.submission-select > span {
+  color: var(--muted);
+  font: 500 10px var(--font-mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.submission-select select {
+  min-width: 0;
+  padding: 11px 12px;
+}
+
+.submission-details {
+  margin: 0;
+  display: grid;
+  grid-template-columns: repeat(
+    2,
+    minmax(0, 1fr)
+  );
+  gap: 12px 18px;
+}
+
+.submission-details > div,
+.submission-dialog dl > div {
+  min-width: 0;
+}
+
+.submission-details dt,
+.submission-dialog dt {
+  color: var(--muted);
+  font: 500 9px var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.submission-details dd,
+.submission-dialog dd {
+  margin: 4px 0 0;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
+.submission-button {
+  min-height: 42px;
+  padding: 10px 16px;
+  border: 1px solid var(--bimap-yellow);
+  background: var(--bimap-yellow);
+  color: var(--bimap-black);
+  font: 600 11px var(--font-mono);
+  cursor: pointer;
+}
+
+.submission-button:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+
+.preflight-results {
+  margin-top: 26px;
+}
+
+.preflight-results h4 {
+  margin: 0 0 12px;
+  font-size: 14px;
+}
+
+.preflight-results ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border-top: 1px solid var(--line);
+}
+
+.preflight-results li {
+  display: grid;
+  grid-template-columns: 74px 1fr;
+  gap: 14px;
+  padding: 11px 0;
+  border-bottom: 1px solid var(--faint);
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.preflight-results li strong {
+  font: 600 9px var(--font-mono);
+  text-transform: uppercase;
+}
+
+.preflight-results li[data-passed="true"] strong {
+  color: var(--bimap-yellow);
+}
+
+.preflight-results li[data-passed="false"] strong {
+  color: var(--negative);
+}
+
+.submission-result {
+  margin-top: 24px;
+  padding: 18px;
+  border: 1px solid var(--line);
+}
+
+.submission-result[data-state="error"] {
+  border-color: var(--negative);
+}
+
+.submission-result strong {
+  font-size: 14px;
+}
+
+.submission-result p {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.submission-dialog {
+  width: min(560px, calc(100% - 32px));
+  padding: 28px;
+  border: 1px solid var(--line);
+  border-radius: 0;
+  background: var(--bg);
+  color: var(--text);
+  box-shadow: 0 20px 80px var(--shadow);
+}
+
+.submission-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.72);
+}
+
+.submission-dialog h3 {
+  margin: 0;
+  font-size: 24px;
+  letter-spacing: -0.03em;
+}
+
+.submission-dialog > p {
+  margin: 14px 0 22px;
+  color: var(--muted);
+  line-height: 1.55;
+}
+
+.submission-dialog dl {
+  display: grid;
+  gap: 14px;
+  margin: 0;
+  padding: 18px 0;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+.submission-resubmit {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 12px;
+  margin-top: 20px;
+  color: var(--warning);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.submission-dialog__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+  margin-top: 24px;
+}
+
+.submission-dialog__actions > button:not(.submission-button) {
+  padding: 10px 16px;
+  border: 1px solid var(--line);
+  background: transparent;
+  cursor: pointer;
+}
+
+@media (max-width: 980px) {
+  .tao-price {
+    min-width: 178px;
+  }
+
+  .tao-price__source {
+    display: none;
+  }
+
+  .submission-layout {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .submission-button {
+    width: max-content;
+  }
+}
+
+@media (max-width: 680px) {
+  .tao-price {
+    min-width: 118px;
+    grid-template-columns: 1fr auto;
+    padding-inline: 8px;
+  }
+
+  .tao-price__unit,
+  .tao-price__stale {
+    display: none;
+  }
+
+  .tao-price__value strong {
+    font-size: 10px;
+  }
+
+  .submission-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .submission-details {
+    grid-template-columns: 1fr;
+  }
+
+  .submission-button {
+    width: 100%;
+  }
+
+  .submission-dialog {
+    padding: 22px;
+  }
+
+  .submission-dialog__actions {
+    flex-direction: column-reverse;
+  }
+
+  .submission-dialog__actions button {
+    width: 100%;
+  }
+}
+
 .site-footer { background: #080808; color: var(--bimap-white); padding: 64px max(32px, calc((100vw - var(--side-width) - 1240px) / 2)); border-top: 1px solid rgba(234,236,236,.14); }
 .site-footer__top { display: grid; grid-template-columns: 1.2fr 1fr; gap: 64px; }
 .footer-brand { display: flex; align-items: flex-start; gap: 18px; }

@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 
 import { Footer } from "./Footer";
+import { ArtifactSubmission } from "./ArtifactSubmission";
 import { Header } from "./Header";
 import { Loading } from "./Loading";
 import { SidePanel } from "./SidePanel";
@@ -141,6 +142,9 @@ export default function DashboardApp() {
               <dl className="detail-list"><Detail label="Profile"><strong>{data.artifact.profile ?? "Not available"}</strong></Detail><Detail label="Version">{data.artifact.version ?? "Not available"}</Detail><Detail label="SHA-256"><code className="hash-value">{data.artifact.hash ?? "Not available"}</code></Detail><Detail label="Size">{available(data.artifact.size_bytes) ? `${integer(data.artifact.size_bytes)} bytes` : "Not available"}</Detail><Detail label="Harnyx validation">{data.artifact.validated === null ? "Not recorded" : <Status value={data.artifact.validated ? "ready" : "unavailable"} text={data.artifact.validated ? "Validated" : "Not validated"} />}</Detail><Detail label="Built">{date(data.artifact.built_at)}</Detail></dl>
               <div className="component-state"><h3>Selective strategy</h3><p>Only components recorded by the artifact builder are shown.</p><div className="component-list">{data.artifact.enabled_components.length ? data.artifact.enabled_components.map((item) => <span className="component-chip" data-state="ready" key={item}>{item.replaceAll("_", " ")}</span>) : <span className="muted-copy">No enabled strategy components recorded.</span>}</div>{data.artifact.disabled_components.length ? <div className="component-disabled"><p>Disabled / ablated</p><div className="component-list">{data.artifact.disabled_components.map((item) => <span className="component-chip" data-state="empty" key={item}>{item.replaceAll("_", " ")}</span>)}</div></div> : null}</div>
             </div> : <Empty>No artifact metadata is available yet. Build an artifact before expecting profile or validation information.</Empty>}
+            <ArtifactSubmission
+              currentArtifact={data.artifact}
+            />
           </div></section>
 
           <section id="slai" className="dashboard-section"><div className="section-content">

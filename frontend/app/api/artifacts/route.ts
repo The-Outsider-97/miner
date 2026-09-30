@@ -5,25 +5,19 @@ import { runMinerJson } from "../../../lib/server/minerPython";
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
-type DashboardResponse = {
-  schema?: unknown;
-};
-
 export async function GET() {
   try {
-    const data =
-      await runMinerJson<DashboardResponse>(
-        "miner.dashboard_api",
-        ["--json"],
-      );
+    const result = await runMinerJson<{
+      ok: boolean;
+      artifacts?: unknown[];
+      error?: string;
+    }>(
+      "miner.submission_api",
+      ["list"],
+    );
 
-    if (data.schema !== "slai-miner-dashboard-v1") {
-      throw new Error(
-        "Unsupported Miner dashboard schema.",
-      );
-    }
-
-    return NextResponse.json(data, {
+    return NextResponse.json(result, {
+      status: result.ok ? 200 : 503,
       headers: {
         "Cache-Control": "no-store",
       },
@@ -31,8 +25,9 @@ export async function GET() {
   } catch {
     return NextResponse.json(
       {
+        ok: false,
         error:
-          "Miner dashboard backend is unavailable.",
+          "Artifact discovery is unavailable.",
       },
       {
         status: 503,

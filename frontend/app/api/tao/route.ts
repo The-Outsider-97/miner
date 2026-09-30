@@ -5,21 +5,19 @@ import { runMinerJson } from "../../../lib/server/minerPython";
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
-type DashboardResponse = {
+type TaoResponse = {
   schema?: unknown;
 };
 
 export async function GET() {
   try {
-    const data =
-      await runMinerJson<DashboardResponse>(
-        "miner.dashboard_api",
-        ["--json"],
-      );
+    const data = await runMinerJson<TaoResponse>(
+      "miner.tao_state_api",
+    );
 
-    if (data.schema !== "slai-miner-dashboard-v1") {
+    if (data.schema !== "slai-miner-tao-v1") {
       throw new Error(
-        "Unsupported Miner dashboard schema.",
+        "Unsupported TAO state schema.",
       );
     }
 
@@ -31,8 +29,7 @@ export async function GET() {
   } catch {
     return NextResponse.json(
       {
-        error:
-          "Miner dashboard backend is unavailable.",
+        error: "TAO data is unavailable.",
       },
       {
         status: 503,

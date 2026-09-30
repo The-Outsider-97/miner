@@ -105,3 +105,107 @@ export type SectionDefinition = {
   id: string;
   label: string;
 };
+
+
+export type TaoCurrency =
+  | "USD"
+  | "EUR"
+  | "GBP"
+  | "BTC";
+
+export type TaoMarketState = {
+  status:
+    | "ready"
+    | "stale"
+    | "unavailable";
+  provider: string;
+  asset: "TAO";
+  prices: Record<TaoCurrency, string> | null;
+  updated_at: string | null;
+  fetched_at: string | null;
+  message: string | null;
+};
+
+export type MinerEarningsState = {
+  status:
+    | "available"
+    | "zero"
+    | "unavailable";
+  netuid: number;
+  earned_tao: string | null;
+  source: string;
+  as_of: string | null;
+  message: string | null;
+};
+
+export type TaoSnapshot = {
+  schema: "slai-miner-tao-v1";
+  generated_at: string;
+  market: TaoMarketState;
+  earnings: MinerEarningsState;
+};
+
+export type PreviousSubmission = {
+  artifact_hash: string;
+  profile: string;
+  status: string;
+  platform_artifact_id: string | null;
+  platform_content_hash: string | null;
+  uid: number | null;
+  size_bytes: number | null;
+  submitted_at: string;
+};
+
+export type ArtifactCandidate = {
+  profile: string | null;
+  version: string | null;
+  sha256: string;
+  size_bytes: number | null;
+  built_at: string | null;
+  manifest_validated: boolean;
+  artifact_exists: boolean;
+  previous_upload: PreviousSubmission | null;
+};
+
+export type PreflightCheck = {
+  name: string;
+  passed: boolean;
+  detail: string;
+};
+
+export type ArtifactPreflight = {
+  eligible: boolean;
+  profile: string | null;
+  version: string | null;
+  sha256: string;
+  size_bytes: number | null;
+  harnyx_max_bytes: number;
+  built_at: string | null;
+  checks: PreflightCheck[];
+  duplicate_upload: boolean;
+  previous_upload: PreviousSubmission | null;
+};
+
+export type SubmissionStatus =
+  | "idle"
+  | "validating"
+  | "ready"
+  | "submitting"
+  | "uploaded_unconfirmed"
+  | "accepted"
+  | "rejected"
+  | "failed";
+
+export type SubmissionResult = {
+  status: SubmissionStatus;
+  acceptance:
+    | "unverified"
+    | "accepted"
+    | "rejected";
+  artifact_id: string | null;
+  content_hash: string;
+  submitted_at: string | null;
+  uid: number | null;
+  size_bytes: number | null;
+  message: string;
+};

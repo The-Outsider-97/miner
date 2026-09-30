@@ -1,5 +1,10 @@
 import DashboardApp from "../app";
+import { TaoProvider } from "../TaoContext";
 
 export default function HomePage() {
-  return <DashboardApp />;
+  return (
+    <TaoProvider>
+      <DashboardApp />
+    </TaoProvider>
+  );
 }
