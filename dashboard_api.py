@@ -11,10 +11,10 @@ from pathlib import Path
 from typing import Any
 
 from benchmark_store import BenchmarkStore
-from slai_miner import dependency_status
 from utils.config_loader import get_config_section, load_config
 from utils.miner_errors import MinerError
-from utils.miner_helpers import PROJECT_ROOT, git_head
+from utils.miner_helpers import PROJECT_ROOT
+from utils.repository_state import benchmark_database_path, dependency_status
 
 _COMPONENTS = (
     "provider_routing",
@@ -25,32 +25,34 @@ _COMPONENTS = (
 )
 
 
-def build_dashboard_snapshot() -> dict[str, Any]:
-    """Return one normalized, frontend-safe dashboard document."""
-
+def build_dashboard_snapshot(*, database_path: str | Path | None = None) -> dict[str, Any]:
+    """Build one normalized read-only document for the browser dashboard."""
     config = load_config()
-    project = get_config_section("project", config=config)
     external = get_config_section("external", config=config)
     slai_config = get_config_section("slai", config=config)
     harnyx_config = get_config_section("harnyx", config=config)
-
-    database_path = PROJECT_ROOT / str(
-        project.get(
-            "results_database",
-            "benchmarks/harnyx/results/miner_benchmarks.sqlite3",
-        )
+    database = (
+        Path(database_path).expanduser().resolve()
+        if database_path is not None
+        else benchmark_database_path(config)
     )
-    benchmark = _benchmark_snapshot(database_path)
+
+    benchmark = _benchmark_snapshot(database)
     latest = benchmark.get("latest")
-    dependencies = _dependency_snapshot(external)
+    dependencies = _dependency_snapshot(config, external)
     selected_agents, measurements = _recorded_slai_runtime(latest)
     metadata = _report_metadata(latest)
+    degraded = (
+        benchmark["state"] == "unavailable"
+        or dependencies["slai"]["status"] != "ready"
+        or dependencies["harnyx"]["status"] != "ready"
+    )
 
     return {
         "schema": "slai-miner-dashboard-v1",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "backend": {
-            "status": "ready",
+            "status": "degraded" if degraded else "ready",
             "benchmark_store": benchmark["state"],
             "data_source": "BenchmarkStore + Harnyx reports + artifact manifests",
             "message": benchmark.get("message"),
@@ -63,9 +65,7 @@ def build_dashboard_snapshot() -> dict[str, Any]:
             "pinned": dependencies["slai"].get("pinned", False),
             "selected_agents": selected_agents,
             "runtime_measurements": measurements,
-            "runtime_evidence": (
-                "recorded" if selected_agents or measurements else "not_recorded"
-            ),
+            "runtime_evidence": "recorded" if selected_agents or measurements else "not_recorded",
             "runtime_candidates": list(slai_config.get("runtime_candidates") or ()),
         },
         "harnyx": {
@@ -85,7 +85,7 @@ def build_dashboard_snapshot() -> dict[str, Any]:
         },
         "performance": _performance_snapshot(latest),
         "versions": {
-            "miner_commit": _safe_miner_commit(),
+            "miner_commit": dependencies["miner"].get("actual_commit"),
             "slai_commit": dependencies["slai"].get("actual_commit"),
             "harnyx_commit": dependencies["harnyx"].get("actual_commit"),
             "dataset_version": metadata.get("dataset_version"),
@@ -105,21 +105,16 @@ def _benchmark_snapshot(database_path: Path) -> dict[str, Any]:
             "latest": None,
             "recent": [],
         }
-
     try:
-        with BenchmarkStore(database_path) as store:
-            rows = store.connection.execute(
-                "SELECT * FROM runs ORDER BY created_at DESC LIMIT 20"
-            ).fetchall()
-            runs = [_decode_run(store, dict(row)) for row in rows]
-    except sqlite3.Error as exc:
+        with BenchmarkStore(database_path, read_only=True) as store:
+            runs = store.recent_run_details(limit=20)
+    except (sqlite3.Error, MinerError) as exc:
         return {
             "state": "unavailable",
             "message": f"BenchmarkStore could not be read: {exc}",
             "latest": None,
             "recent": [],
         }
-
     if not runs:
         return {
             "state": "empty",
@@ -130,57 +125,31 @@ def _benchmark_snapshot(database_path: Path) -> dict[str, Any]:
     return {"state": "available", "message": None, "latest": runs[0], "recent": runs}
 
 
-def _decode_run(store: BenchmarkStore, row: dict[str, Any]) -> dict[str, Any]:
-    row["ablation"] = _json_object(row.pop("ablation_json", "{}"))
-    row["slai_config"] = _json_object(row.pop("slai_config_json", "{}"))
-    row["summary"] = _json_object(row.pop("raw_summary_json", "{}"))
-    tasks = []
-    for task in store.task_results(str(row["run_id"])):
-        normalized = dict(task)
-        normalized["provider_model"] = _json_value(
-            normalized.pop("provider_model_json", "{}"),
-            default={},
-        )
-        tasks.append(normalized)
-    row["tasks"] = tasks
-    return row
-
-
-def _dependency_snapshot(external: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
-    output: dict[str, dict[str, Any]] = {}
+def _dependency_snapshot(
+    config: Mapping[str, Any], external: Mapping[str, Any]
+) -> dict[str, dict[str, Any]]:
+    fallback: dict[str, dict[str, Any]] = {}
     for name in ("slai", "harnyx"):
         settings = external.get(name) or {}
-        output[name] = {
+        fallback[name] = {
             "status": "unavailable",
-            "expected_commit": str(settings.get("expected_commit") or ""),
+            "expected_commit": str(settings.get("expected_commit") or "") if isinstance(settings, Mapping) else "",
             "actual_commit": None,
             "pinned": False,
         }
+    fallback["miner"] = {"status": "unavailable", "actual_commit": None, "pinned": False}
     try:
-        live = dependency_status()
+        return dependency_status(config)
     except MinerError as exc:
-        for item in output.values():
+        for item in fallback.values():
             item["detail"] = str(exc)
-        return output
-    for name in ("slai", "harnyx"):
-        current = live.get(name) or {}
-        output[name] = {
-            "status": "ready" if current.get("actual_commit") else "unavailable",
-            "expected_commit": current.get("expected_commit"),
-            "actual_commit": current.get("actual_commit"),
-            "pinned": bool(current.get("pinned")),
-        }
-    return output
+        return fallback
 
 
 def _artifact_snapshot(latest: Mapping[str, Any] | None) -> dict[str, Any] | None:
     manifest = _latest_manifest(PROJECT_ROOT / "benchmarks/harnyx/manifests")
     if manifest is not None:
-        strategy = (
-            manifest.get("strategy")
-            if isinstance(manifest.get("strategy"), Mapping)
-            else {}
-        )
+        strategy = manifest.get("strategy") if isinstance(manifest.get("strategy"), Mapping) else {}
         return {
             "profile": manifest.get("profile"),
             "version": manifest.get("profile"),
@@ -190,9 +159,7 @@ def _artifact_snapshot(latest: Mapping[str, Any] | None) -> dict[str, Any] | Non
             "built_at": manifest.get("built_at"),
             "strategy": strategy,
             "enabled_components": [key for key in _COMPONENTS if strategy.get(key) is True],
-            "disabled_components": list(
-                _mapping(manifest.get("ablation")).get("disabled_components") or ()
-            ),
+            "disabled_components": list(_mapping(manifest.get("ablation")).get("disabled_components") or ()),
         }
     if latest is None:
         return None
@@ -205,23 +172,25 @@ def _artifact_snapshot(latest: Mapping[str, Any] | None) -> dict[str, Any] | Non
         "built_at": None,
         "strategy": None,
         "enabled_components": [],
-        "disabled_components": list(
-            _mapping(latest.get("ablation")).get("disabled_components") or ()
-        ),
+        "disabled_components": list(_mapping(latest.get("ablation")).get("disabled_components") or ()),
     }
 
 
 def _latest_manifest(root: Path) -> dict[str, Any] | None:
     if not root.exists():
         return None
-    for path in sorted(root.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
+    candidates: list[tuple[str, str, dict[str, Any]]] = []
+    for path in root.glob("*.json"):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
         if isinstance(payload, dict):
-            return payload
-    return None
+            candidates.append((str(payload.get("built_at") or ""), path.name, payload))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return candidates[0][2]
 
 
 def _performance_snapshot(latest: Mapping[str, Any] | None) -> dict[str, Any] | None:
@@ -232,20 +201,31 @@ def _performance_snapshot(latest: Mapping[str, Any] | None) -> dict[str, Any] | 
         tasks = ()
     token_usage = 0
     tool_calls = 0
-    providers: set[str] = set()
-    for raw_task in tasks:
-        if not isinstance(raw_task, Mapping):
+    provider_models: set[str] = set()
+    for raw in tasks:
+        if not isinstance(raw, Mapping):
             continue
-        token_usage += _int_or_zero(raw_task.get("token_usage"))
-        tool_calls += _int_or_zero(raw_task.get("tool_calls"))
-        provider_model = raw_task.get("provider_model")
-        if isinstance(provider_model, Mapping):
-            providers.update(str(key) for key in provider_model if str(key).strip())
+        token_usage += _int_or_zero(raw.get("token_usage"))
+        tool_calls += _int_or_zero(raw.get("tool_calls"))
+        usage = raw.get("provider_model")
+        if not isinstance(usage, Mapping):
+            continue
+        for provider, models in usage.items():
+            provider_name = str(provider).strip()
+            if not provider_name:
+                continue
+            if isinstance(models, Mapping):
+                for model in models:
+                    model_name = str(model).strip()
+                    if model_name:
+                        provider_models.add(f"{provider_name} / {model_name}")
+            else:
+                provider_models.add(provider_name)
     return {
         "total_cost_usd": latest.get("total_cost_usd"),
         "token_usage": token_usage,
         "tool_calls": tool_calls,
-        "provider_models": sorted(providers),
+        "provider_models": sorted(provider_models),
         "median_runtime_ms": latest.get("median_runtime_ms"),
         "p95_runtime_ms": latest.get("p95_runtime_ms"),
         "timeout_rate": latest.get("timeout_rate"),
@@ -268,8 +248,7 @@ def _recorded_slai_runtime(
     raw_measurements = config.get("runtime_measurements") or ()
     measurements = (
         [dict(item) for item in raw_measurements if isinstance(item, Mapping)]
-        if isinstance(raw_measurements, Sequence)
-        and not isinstance(raw_measurements, (str, bytes, bytearray))
+        if isinstance(raw_measurements, Sequence) and not isinstance(raw_measurements, (str, bytes, bytearray))
         else []
     )
     return selected, measurements
@@ -298,10 +277,12 @@ def _report_metadata(latest: Mapping[str, Any] | None) -> dict[str, Any]:
             "suite_slug": manifest.get("suite_slug"),
         }
     batch = _mapping(report.get("batch_metadata"))
+    batch_payload = _mapping(batch.get("batch"))
+    summary = _mapping(batch.get("summary"))
     return {
-        "dataset_version": batch.get("data_version") or batch.get("dataset_version"),
-        "scoring_version": batch.get("scoring_version"),
-        "suite_slug": batch.get("suite_slug"),
+        "dataset_version": batch.get("data_version") or batch.get("dataset_version") or batch_payload.get("data_version") or summary.get("data_version"),
+        "scoring_version": batch.get("scoring_version") or batch_payload.get("scoring_version") or summary.get("scoring_version"),
+        "suite_slug": batch.get("suite_slug") or batch_payload.get("suite_slug") or summary.get("suite_slug"),
     }
 
 
@@ -313,33 +294,11 @@ def _frontend_run(run: Mapping[str, Any] | None) -> dict[str, Any] | None:
         "batch_id", "source_batch_id", "total_score", "comparison_score",
         "fast_score", "normal_score", "wins", "losses", "ties",
         "total_cost_usd", "median_runtime_ms", "p95_runtime_ms", "timeout_rate",
-        "error_rate", "citation_failure_rate", "structured_output_failure_rate",
-        "created_at",
+        "error_rate", "citation_failure_rate", "structured_output_failure_rate", "created_at",
     )
     payload = {key: run.get(key) for key in keys}
     payload["champion_selected"] = _bool_or_none(run.get("champion_selected"))
     return payload
-
-
-def _safe_miner_commit() -> str | None:
-    try:
-        return git_head(PROJECT_ROOT)
-    except MinerError:
-        return None
-
-
-def _json_object(raw: object) -> dict[str, Any]:
-    value = _json_value(raw, default={})
-    return dict(value) if isinstance(value, Mapping) else {}
-
-
-def _json_value(raw: object, *, default: Any) -> Any:
-    if not isinstance(raw, str):
-        return default
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return default
 
 
 def _mapping(value: object) -> Mapping[str, Any]:
@@ -353,9 +312,7 @@ def _value(mapping: object, key: str) -> Any:
 def _int_or_zero(value: object) -> int:
     if isinstance(value, bool):
         return 0
-    if isinstance(value, (int, float)):
-        return int(value)
-    return 0
+    return int(value) if isinstance(value, (int, float)) else 0
 
 
 def _bool_or_none(value: object) -> bool | None:
