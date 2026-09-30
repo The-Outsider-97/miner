@@ -8,21 +8,18 @@ from __future__ import annotations
 import argparse
 import json
 import uuid
+
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from artifact_builder import build_all, build_artifact
-from benchmark_store import BenchmarkStore
-from utils.config_loader import get_config_section
-from utils.miner_errors import BenchmarkExecutionError, MinerConfigurationError, MinerError
-from utils.miner_helpers import PROJECT_ROOT, require_external_repository, run_checked
-from utils.repository_state import (
-    benchmark_database_path,
-    dependency_status,
-    repository_commits,
-)
+from miner.artifact_builder import build_all, build_artifact
+from miner.benchmark_store import BenchmarkStore
+from miner.utils.config_loader import get_config_section
+from miner.utils.miner_errors import BenchmarkExecutionError, MinerConfigurationError, MinerError
+from miner.utils.miner_helpers import PROJECT_ROOT, require_external_repository, run_checked
+from miner.utils.repository_state import benchmark_database_path, dependency_status, repository_commits
 
 _ARTIFACT_COMPONENTS = (
     "provider_routing",
@@ -40,7 +37,7 @@ def _store() -> BenchmarkStore:
 def _output_dir(label: str) -> Path:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     suffix = uuid.uuid4().hex[:8]
-    path = PROJECT_ROOT / "benchmarks/harnyx/results" / f"{stamp}-{suffix}-{label}"
+    path = PROJECT_ROOT / "miner/benchmarks/harnyx/results" / f"{stamp}-{suffix}-{label}"
     path.mkdir(parents=True, exist_ok=False)
     return path
 
@@ -82,24 +79,14 @@ def _harnyx_command_settings(name: str) -> Mapping[str, Any]:
     return settings
 
 
-def _required_text_setting(
-    settings: Mapping[str, Any],
-    key: str,
-    *,
-    section: str,
-) -> str:
+def _required_text_setting(settings: Mapping[str, Any], key: str, *, section: str) -> str:
     value = str(settings.get(key) or "").strip()
     if not value:
         raise MinerConfigurationError(f"{section}.{key} must be configured")
     return value
 
 
-def _report_path(
-    summary: Mapping[str, Any],
-    *,
-    key: str,
-    output_dir: Path,
-) -> Path:
+def _report_path(summary: Mapping[str, Any], *, key: str, output_dir: Path) -> Path:
     raw = summary.get(key)
     if not isinstance(raw, str) or not raw.strip():
         raise BenchmarkExecutionError(
@@ -168,6 +155,7 @@ def local_eval(
     completed = run_checked(command, cwd=harnyx, timeout=None)
     summary = _summary(completed.stdout)
     report = _report_path(summary, key="json_report", output_dir=output)
+    run_id: Any | None = None
     with _store() as store:
         run_id = store.ingest_report(
             report,
@@ -243,6 +231,7 @@ def local_benchmark(
     completed = run_checked(command, cwd=harnyx, timeout=None)
     summary = _summary(completed.stdout)
     report = _report_path(summary, key="json_report", output_dir=output)
+    run_id: Any | None = None
     with _store() as store:
         run_id = store.ingest_report(
             report,
@@ -271,9 +260,7 @@ def _add_ablation_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Build and benchmark SLAI-derived Harnyx SN67 artifacts."
-    )
+    parser = argparse.ArgumentParser(description="Build and benchmark SLAI-derived Harnyx SN67 artifacts.")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("status")
 
@@ -322,6 +309,7 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
+    result: Any = {}
     try:
         if args.command == "status":
             result = dependency_status()
@@ -340,7 +328,7 @@ def main(argv: list[str] | None = None) -> int:
                     disabled_components=tuple(args.disable),
                 ).to_dict()
         elif args.command == "slai-smoke":
-            from adapters.slai import SlaiRuntime
+            from miner.adapters.slai import SlaiRuntime
 
             agents = list(args.agent)
             if args.reason and "reasoning" not in agents:
