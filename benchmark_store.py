@@ -1,8 +1,8 @@
 """Persistent experiment ledger for official Harnyx evaluation reports.
 
-The database stores Miner benchmark analytics only. It is deliberately separate
-from SLAI SharedMemory, KnowledgeMemory, LanguageMemory, and agent state. Harnyx
-JSON remains the scoring source of truth; this module only normalizes it.
+BenchmarkStore owns Miner experiment analytics only. It is deliberately separate
+from SLAI SharedMemory and agent memory. Official Harnyx JSON remains the scoring
+source of truth; this module only normalizes it for comparison and observability.
 """
 
 from __future__ import annotations
@@ -38,18 +38,34 @@ class StoredRun:
 class BenchmarkStore:
     """SQLite-backed store for reproducible Miner experiments."""
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, read_only: bool = False) -> None:
         self.path = Path(path).expanduser().resolve()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.connection = sqlite3.connect(self.path)
-        self.connection.row_factory = sqlite3.Row
-        self.connection.execute("PRAGMA foreign_keys=ON")
-        self.connection.execute("PRAGMA journal_mode=WAL")
-        self._create_schema()
+        self.read_only = bool(read_only)
+        if self.read_only:
+            if not self.path.is_file():
+                raise BenchmarkExecutionError(
+                    "BenchmarkStore database does not exist",
+                    context={"path": str(self.path)},
+                )
+            self._connection = sqlite3.connect(
+                self.path.as_uri() + "?mode=ro", uri=True, timeout=5.0
+            )
+        else:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._connection = sqlite3.connect(self.path, timeout=5.0)
+
+        self._connection.row_factory = sqlite3.Row
+        self._connection.execute("PRAGMA foreign_keys=ON")
+        self._connection.execute("PRAGMA busy_timeout=5000")
+        if self.read_only:
+            self._connection.execute("PRAGMA query_only=ON")
+        else:
+            self._connection.execute("PRAGMA journal_mode=WAL")
+            self._create_schema()
 
     def _create_schema(self) -> None:
-        with self.connection:
-            self.connection.executescript(
+        with self._connection:
+            self._connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS runs(
                   run_id TEXT PRIMARY KEY, run_kind TEXT NOT NULL, report_path TEXT NOT NULL,
@@ -77,6 +93,13 @@ class BenchmarkStore:
                 """
             )
 
+    def _ensure_writable(self) -> None:
+        if self.read_only:
+            raise BenchmarkExecutionError(
+                "BenchmarkStore was opened read-only",
+                context={"path": str(self.path)},
+            )
+
     def ingest_report(
         self,
         report_path: str | Path,
@@ -87,6 +110,7 @@ class BenchmarkStore:
         ablation: Mapping[str, Any] | None = None,
         slai_config: Mapping[str, Any] | None = None,
     ) -> str:
+        self._ensure_writable()
         path = Path(report_path).expanduser().resolve()
         try:
             report = json.loads(path.read_text(encoding="utf-8"))
@@ -103,107 +127,156 @@ class BenchmarkStore:
             if "local_result_summary" in report
             else _normalize_benchmark(report)
         )
-        # One stored row is one experiment execution. A Harnyx batch/run ID is an
-        # upstream identity and is stored separately; it is not a unique Miner run
-        # identity because many candidate artifacts intentionally reuse one batch.
         run_id = str(uuid.uuid4())
-        created = datetime.now(timezone.utc).isoformat()
+        created_at = datetime.now(timezone.utc).isoformat()
+        run = {
+            "run_id": run_id,
+            "run_kind": normalized["kind"],
+            "report_path": str(path),
+            "artifact_id": normalized["artifact_id"],
+            "artifact_hash": normalized["artifact_hash"],
+            "artifact_version": artifact_version,
+            "strategy": strategy,
+            "batch_id": normalized["batch_id"],
+            "source_batch_id": normalized["source_batch_id"],
+            "total_score": normalized["total_score"],
+            "comparison_score": normalized["comparison_score"],
+            "fast_score": normalized["fast_score"],
+            "normal_score": normalized["normal_score"],
+            "wins": normalized["wins"],
+            "losses": normalized["losses"],
+            "ties": normalized["ties"],
+            "total_cost_usd": normalized["cost"],
+            "median_runtime_ms": normalized["median"],
+            "p95_runtime_ms": normalized["p95"],
+            "timeout_rate": normalized["timeout_rate"],
+            "error_rate": normalized["error_rate"],
+            "citation_failure_rate": normalized["citation_rate"],
+            "structured_output_failure_rate": normalized["structured_rate"],
+            "champion_selected": (
+                None if normalized["champion"] is None else int(normalized["champion"])
+            ),
+            "ablation_json": _dump(ablation or {}),
+            "slai_config_json": _dump(slai_config or {}),
+            "harnyx_commit": str(commits.get("harnyx", "unknown")),
+            "slai_commit": str(commits.get("slai", "unknown")),
+            "miner_commit": str(commits.get("miner", "unknown")),
+            "raw_summary_json": _dump(normalized["summary"]),
+            "created_at": created_at,
+        }
+        tasks = [
+            {
+                "run_id": run_id,
+                "task_id": item["task_id"],
+                "query_mode": item["mode"],
+                "score": item["score"],
+                "runtime_ms": item["runtime"],
+                "cost_usd": item["cost"],
+                "tool_calls": item["calls"],
+                "token_usage": item["tokens"],
+                "provider_model_json": _dump(item["provider"]),
+                "timeout": int(item["timeout"]),
+                "error_category": item["error"],
+                "citation_failure": int(item["citation"]),
+                "structured_output_failure": int(item["structured"]),
+            }
+            for item in normalized["tasks"]
+        ]
 
-        with self.connection:
-            self.connection.execute(
-                """INSERT INTO runs VALUES(
-                ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    run_id,
-                    normalized["kind"],
-                    str(path),
-                    normalized["artifact_id"],
-                    normalized["artifact_hash"],
-                    artifact_version,
-                    strategy,
-                    normalized["batch_id"],
-                    normalized["source_batch_id"],
-                    normalized["total_score"],
-                    normalized["comparison_score"],
-                    normalized["fast_score"],
-                    normalized["normal_score"],
-                    normalized["wins"],
-                    normalized["losses"],
-                    normalized["ties"],
-                    normalized["cost"],
-                    normalized["median"],
-                    normalized["p95"],
-                    normalized["timeout_rate"],
-                    normalized["error_rate"],
-                    normalized["citation_rate"],
-                    normalized["structured_rate"],
-                    None if normalized["champion"] is None else int(normalized["champion"]),
-                    _dump(ablation or {}),
-                    _dump(slai_config or {}),
-                    str(commits.get("harnyx", "unknown")),
-                    str(commits.get("slai", "unknown")),
-                    str(commits.get("miner", "unknown")),
-                    _dump(normalized["summary"]),
-                    created,
-                ),
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO runs(
+                  run_id,run_kind,report_path,artifact_id,artifact_hash,artifact_version,strategy,
+                  batch_id,source_batch_id,total_score,comparison_score,fast_score,normal_score,
+                  wins,losses,ties,total_cost_usd,median_runtime_ms,p95_runtime_ms,timeout_rate,
+                  error_rate,citation_failure_rate,structured_output_failure_rate,champion_selected,
+                  ablation_json,slai_config_json,harnyx_commit,slai_commit,miner_commit,
+                  raw_summary_json,created_at
+                ) VALUES(
+                  :run_id,:run_kind,:report_path,:artifact_id,:artifact_hash,:artifact_version,:strategy,
+                  :batch_id,:source_batch_id,:total_score,:comparison_score,:fast_score,:normal_score,
+                  :wins,:losses,:ties,:total_cost_usd,:median_runtime_ms,:p95_runtime_ms,:timeout_rate,
+                  :error_rate,:citation_failure_rate,:structured_output_failure_rate,:champion_selected,
+                  :ablation_json,:slai_config_json,:harnyx_commit,:slai_commit,:miner_commit,
+                  :raw_summary_json,:created_at
+                )
+                """,
+                run,
             )
-            self.connection.executemany(
-                "INSERT INTO task_results VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                [
-                    (
-                        run_id,
-                        task["task_id"],
-                        task["mode"],
-                        task["score"],
-                        task["runtime"],
-                        task["cost"],
-                        task["calls"],
-                        task["tokens"],
-                        _dump(task["provider"]),
-                        int(task["timeout"]),
-                        task["error"],
-                        int(task["citation"]),
-                        int(task["structured"]),
-                    )
-                    for task in normalized["tasks"]
-                ],
+            self._connection.executemany(
+                """
+                INSERT INTO task_results(
+                  run_id,task_id,query_mode,score,runtime_ms,cost_usd,tool_calls,token_usage,
+                  provider_model_json,timeout,error_category,citation_failure,structured_output_failure
+                ) VALUES(
+                  :run_id,:task_id,:query_mode,:score,:runtime_ms,:cost_usd,:tool_calls,:token_usage,
+                  :provider_model_json,:timeout,:error_category,:citation_failure,:structured_output_failure
+                )
+                """,
+                tasks,
             )
         return run_id
 
     def latest_runs(self, *, limit: int = 20) -> list[StoredRun]:
         if limit < 1:
             raise ValueError("limit must be >= 1")
-        rows = self.connection.execute(
-            """SELECT run_id,run_kind,strategy,artifact_hash,total_score,
-                      total_cost_usd,median_runtime_ms,p95_runtime_ms,error_rate,created_at
+        rows = self._connection.execute(
+            """SELECT run_id,run_kind,strategy,artifact_hash,total_score,total_cost_usd,
+                      median_runtime_ms,p95_runtime_ms,error_rate,created_at
                FROM runs ORDER BY created_at DESC LIMIT ?""",
             (limit,),
         ).fetchall()
         return [
             StoredRun(
-                row["run_id"],
-                row["run_kind"],
-                row["strategy"],
-                row["artifact_hash"],
-                row["total_score"],
-                row["total_cost_usd"],
-                row["median_runtime_ms"],
-                row["p95_runtime_ms"],
-                row["error_rate"],
-                row["created_at"],
+                row["run_id"], row["run_kind"], row["strategy"], row["artifact_hash"],
+                row["total_score"], row["total_cost_usd"], row["median_runtime_ms"],
+                row["p95_runtime_ms"], row["error_rate"], row["created_at"],
             )
             for row in rows
         ]
 
+    def recent_run_details(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        """Return normalized run rows plus tasks using two bounded queries."""
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        rows = self._connection.execute(
+            "SELECT * FROM runs ORDER BY created_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+        if not rows:
+            return []
+        run_ids = [str(row["run_id"]) for row in rows]
+        placeholders = ",".join("?" for _ in run_ids)
+        task_rows = self._connection.execute(
+            f"SELECT * FROM task_results WHERE run_id IN ({placeholders}) ORDER BY run_id,task_id",
+            run_ids,
+        ).fetchall()
+        by_run: dict[str, list[dict[str, Any]]] = {run_id: [] for run_id in run_ids}
+        for row in task_rows:
+            task = dict(row)
+            task["provider_model"] = _load_json(
+                task.pop("provider_model_json"), "task_results.provider_model_json"
+            )
+            by_run[str(row["run_id"])].append(task)
+
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["ablation"] = _load_json(item.pop("ablation_json"), "runs.ablation_json")
+            item["slai_config"] = _load_json(item.pop("slai_config_json"), "runs.slai_config_json")
+            item["summary"] = _load_json(item.pop("raw_summary_json"), "runs.raw_summary_json")
+            item["tasks"] = by_run[str(row["run_id"])]
+            result.append(item)
+        return result
+
     def task_results(self, run_id: str) -> list[dict[str, Any]]:
-        rows = self.connection.execute(
-            "SELECT * FROM task_results WHERE run_id=? ORDER BY task_id",
-            (run_id,),
+        rows = self._connection.execute(
+            "SELECT * FROM task_results WHERE run_id=? ORDER BY task_id", (run_id,)
         ).fetchall()
         return [dict(row) for row in rows]
 
     def close(self) -> None:
-        self.connection.close()
+        self._connection.close()
 
     def __enter__(self) -> "BenchmarkStore":
         return self
@@ -215,135 +288,96 @@ class BenchmarkStore:
 
 def _normalize_eval(report: Mapping[str, Any]) -> dict[str, Any]:
     identifiers = _map(report.get("identifiers"))
-    artifacts = _map(report.get("artifacts"))
-    target_artifact = _map(artifacts.get("target"))
+    target_artifact = _map(_map(report.get("artifacts")).get("target"))
     summary = _map(report.get("local_result_summary"))
     head = _map(summary.get("head_to_head"))
     selection = _map(summary.get("local_champion_selection"))
-    mode_map = _mode_map(report)
+    modes = _mode_map(report)
     tasks = []
-    for item in _seq(report.get("tasks")):
-        row = _map(item)
+    for raw in _seq(report.get("tasks")):
+        row = _map(raw)
         target = _map(row.get("target"))
         task_id = str(row.get("task_id") or "")
         if task_id and target:
-            tasks.append(_task_from_eval(task_id, mode_map.get(task_id, "unknown"), target))
+            tasks.append(_task_from_eval(task_id, modes.get(task_id, "unknown"), target))
 
     scores = [task["score"] for task in tasks if task["score"] is not None]
-    fast = [
-        task["score"]
-        for task in tasks
-        if task["mode"] == "fast" and task["score"] is not None
-    ]
-    normal = [
-        task["score"]
-        for task in tasks
-        if task["mode"] == "normal" and task["score"] is not None
-    ]
-    return _aggregate(
-        {
-            "kind": "local_eval",
-            "batch_id": str(identifiers.get("batch_id") or ""),
-            "source_batch_id": None,
-            "artifact_id": str(
-                target_artifact.get("artifact_id")
-                or identifiers.get("target_artifact_id")
-                or ""
-            ),
-            "artifact_hash": str(
-                target_artifact.get("sha256")
-                or target_artifact.get("content_hash")
-                or ""
-            ),
-            "total_score": sum(scores) if scores else None,
-            "comparison_score": _mean(scores),
-            "fast_score": _mean(fast),
-            "normal_score": _mean(normal),
-            "wins": _int(head.get("wins")),
-            "losses": _int(head.get("losses")),
-            "ties": _int(head.get("ties")),
-            "champion": (
-                selection.get("selected_label") == "target"
-                if selection.get("selected_label") is not None
-                else None
-            ),
-            "summary": summary,
-            "tasks": tasks,
-        }
+    fast = [task["score"] for task in tasks if task["mode"] == "fast" and task["score"] is not None]
+    normal = [task["score"] for task in tasks if task["mode"] == "normal" and task["score"] is not None]
+    target_leaderboard = next(
+        (_map(item) for item in _seq(summary.get("leaderboard")) if _map(item).get("label") == "target"),
+        {},
     )
+    return _aggregate({
+        "kind": "local_eval",
+        "batch_id": str(identifiers.get("batch_id") or "") or None,
+        "source_batch_id": None,
+        "artifact_id": str(target_artifact.get("artifact_id") or identifiers.get("target_artifact_id") or ""),
+        "artifact_hash": str(target_artifact.get("sha256") or target_artifact.get("content_hash") or ""),
+        "total_score": _float(target_leaderboard.get("total_score")) if target_leaderboard else (sum(scores) if scores else None),
+        "comparison_score": _float(target_leaderboard.get("avg_score")) if target_leaderboard else _mean(scores),
+        "fast_score": _mean(fast),
+        "normal_score": _mean(normal),
+        "wins": _int(head.get("wins")),
+        "losses": _int(head.get("losses")),
+        "ties": _int(head.get("ties")),
+        "champion": (
+            selection.get("selected_label") == "target"
+            if selection.get("selected_label") is not None else None
+        ),
+        "summary": summary,
+        "tasks": tasks,
+    })
 
 
 def _normalize_benchmark(report: Mapping[str, Any]) -> dict[str, Any]:
     identifiers = _map(report.get("identifiers"))
-    artifacts = _map(report.get("artifacts"))
-    target = _map(artifacts.get("target"))
+    target = _map(_map(report.get("artifacts")).get("target"))
     summary = _map(report.get("summary"))
     tasks = []
-    for item in _seq(report.get("items")):
-        row = _map(item)
+    for raw in _seq(report.get("items")):
+        row = _map(raw)
         task_id = str(row.get("task_id") or "")
-        invocation = _map(row.get("invocation"))
-        error = _map(row.get("error"))
         if not task_id:
             continue
-        if invocation:
-            costs = _map(invocation.get("cost_totals"))
-            tokens = _map(invocation.get("token_usage"))
-            error = _map(invocation.get("error")) or error
-            tasks.append(
-                _task(
-                    task_id,
-                    "benchmark",
-                    row.get("score"),
-                    invocation.get("elapsed_ms"),
-                    costs,
-                    tokens,
-                    {},
-                    error,
-                )
-            )
-        else:
-            tasks.append(_task(task_id, "benchmark", row.get("score"), None, {}, {}, {}, error))
-
+        invocation = _map(row.get("invocation"))
+        error = _map(invocation.get("error")) or _map(row.get("error"))
+        tasks.append(_task(
+            task_id,
+            "benchmark",
+            row.get("score"),
+            invocation.get("elapsed_ms"),
+            _map(invocation.get("cost_totals")),
+            _map(invocation.get("token_usage")),
+            {},
+            error,
+        ))
     score = _float(summary.get("mean_total_score"))
-    return _aggregate(
-        {
-            "kind": "local_benchmark",
-            "batch_id": None,
-            "source_batch_id": str(identifiers.get("source_batch_id") or ""),
-            "artifact_id": str(
-                target.get("artifact_id") or identifiers.get("target_artifact_id") or ""
-            ),
-            "artifact_hash": str(target.get("sha256") or target.get("content_hash") or ""),
-            "total_score": score,
-            "comparison_score": score,
-            "fast_score": None,
-            "normal_score": None,
-            "wins": None,
-            "losses": None,
-            "ties": None,
-            "champion": None,
-            "summary": summary,
-            "tasks": tasks,
-        }
-    )
+    return _aggregate({
+        "kind": "local_benchmark",
+        "batch_id": None,
+        "source_batch_id": str(identifiers.get("source_batch_id") or "") or None,
+        "artifact_id": str(target.get("artifact_id") or identifiers.get("target_artifact_id") or ""),
+        "artifact_hash": str(target.get("sha256") or target.get("content_hash") or ""),
+        "total_score": score,
+        "comparison_score": None,
+        "fast_score": None,
+        "normal_score": None,
+        "wins": None,
+        "losses": None,
+        "ties": None,
+        "champion": None,
+        "summary": summary,
+        "tasks": tasks,
+    })
 
 
-def _task_from_eval(
-    task_id: str,
-    mode: str,
-    target: Mapping[str, Any],
-) -> dict[str, Any]:
+def _task_from_eval(task_id: str, mode: str, target: Mapping[str, Any]) -> dict[str, Any]:
     usage = _map(target.get("cost_and_usage"))
     return _task(
-        task_id,
-        mode,
-        target.get("score"),
-        target.get("elapsed_ms"),
-        _map(usage.get("cost_totals")),
-        _map(usage.get("token_usage")),
-        usage.get("provider_model_usage") or {},
-        _map(target.get("error")),
+        task_id, mode, target.get("score"), target.get("elapsed_ms"),
+        _map(usage.get("cost_totals")), _map(usage.get("token_usage")),
+        usage.get("provider_model_usage") or {}, _map(target.get("error")),
     )
 
 
@@ -357,7 +391,8 @@ def _task(
     provider: Any,
     error: Mapping[str, Any],
 ) -> dict[str, Any]:
-    text = _dump(error).lower()
+    error_text = _dump(error).lower()
+    error_code = str(error.get("code") or "").strip() or None
     return {
         "task_id": task_id,
         "mode": mode,
@@ -367,14 +402,10 @@ def _task(
         "calls": _sum(costs, "llm_call_count", "search_tool_call_count", "embedding_call_count"),
         "tokens": _int(tokens.get("total_tokens")),
         "provider": provider,
-        "timeout": "timeout" in text or "deadline" in text,
-        "error": (
-            str(error.get("code"))
-            if error.get("code") not in (None, "")
-            else None
-        ),
-        "citation": "citation" in text,
-        "structured": any(term in text for term in ("structured", "schema", "output")),
+        "timeout": "timeout" in error_text or "deadline" in error_text,
+        "error": error_code,
+        "citation": "citation" in error_text,
+        "structured": any(term in error_text for term in ("structured", "schema", "response output", "output_schema")),
     }
 
 
@@ -383,43 +414,30 @@ def _aggregate(data: dict[str, Any]) -> dict[str, Any]:
     runtimes = [task["runtime"] for task in tasks if task["runtime"] is not None]
     costs = [task["cost"] for task in tasks if task["cost"] is not None]
     count = len(tasks)
-    data.update(
-        {
-            "cost": sum(costs) if costs else None,
-            "median": statistics.median(runtimes) if runtimes else None,
-            "p95": _p95(runtimes),
-            "timeout_rate": (
-                sum(task["timeout"] for task in tasks) / count if count else None
-            ),
-            "error_rate": (
-                sum(task["error"] is not None for task in tasks) / count if count else None
-            ),
-            "citation_rate": (
-                sum(task["citation"] for task in tasks) / count if count else None
-            ),
-            "structured_rate": (
-                sum(task["structured"] for task in tasks) / count if count else None
-            ),
-        }
-    )
+    data.update({
+        "cost": sum(costs) if costs else None,
+        "median": statistics.median(runtimes) if runtimes else None,
+        "p95": _p95(runtimes),
+        "timeout_rate": sum(task["timeout"] for task in tasks) / count if count else None,
+        "error_rate": sum(task["error"] is not None for task in tasks) / count if count else None,
+        "citation_rate": sum(task["citation"] for task in tasks) / count if count else None,
+        "structured_rate": sum(task["structured"] for task in tasks) / count if count else None,
+    })
     return data
 
 
 def _mode_map(report: Mapping[str, Any]) -> dict[str, str]:
     batch = _map(_map(report.get("batch_metadata")).get("batch"))
-    output = {}
-    for item in _seq(batch.get("tasks")):
-        task = _map(item)
-        query = _map(task.get("query"))
+    output: dict[str, str] = {}
+    for raw in _seq(batch.get("tasks")):
+        task = _map(raw)
         task_id = str(task.get("task_id") or task.get("id") or "")
         if task_id:
-            output[task_id] = "fast" if query.get("fast") is True else "normal"
+            output[task_id] = "fast" if _map(task.get("query")).get("fast") is True else "normal"
     return output
 
 
 def _p95(values: Sequence[float]) -> float | None:
-    if not values:
-        return None
     ordered = sorted(value for value in values if math.isfinite(value))
     if not ordered:
         return None
@@ -440,10 +458,10 @@ def _mean(values: Sequence[float]) -> float | None:
 
 def _float(value: Any) -> float | None:
     try:
-        number = float(value)
+        result = float(value)
     except (TypeError, ValueError):
         return None
-    return number if math.isfinite(number) else None
+    return result if math.isfinite(result) else None
 
 
 def _int(value: Any) -> int | None:
@@ -459,11 +477,25 @@ def _sum(mapping: Mapping[str, Any], *keys: str) -> int | None:
     return sum(found) if found else None
 
 
+def _load_json(raw: object, field: str) -> dict[str, Any]:
+    if not isinstance(raw, str):
+        raise BenchmarkExecutionError(
+            "stored BenchmarkStore JSON field is not text",
+            context={"field": field, "actual_type": type(raw).__name__},
+        )
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise BenchmarkExecutionError(
+            "stored BenchmarkStore JSON is malformed", context={"field": field}
+        ) from exc
+    if not isinstance(value, Mapping):
+        raise BenchmarkExecutionError(
+            "stored BenchmarkStore JSON field must be an object",
+            context={"field": field, "actual_type": type(value).__name__},
+        )
+    return dict(value)
+
+
 def _dump(value: Any) -> str:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        default=str,
-    )
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
