@@ -55,6 +55,74 @@ function pythonExecutable(): string {
     : "python3";
 }
 
+function runtimeModuleName(moduleName: string): string {
+  const packageName = path.basename(minerRoot());
+
+  if (moduleName === "miner") {
+    return packageName;
+  }
+
+  if (moduleName.startsWith("miner.")) {
+    return `${packageName}${moduleName.slice("miner".length)}`;
+  }
+
+  return moduleName;
+}
+
+function minerEnvironment(): NodeJS.ProcessEnv {
+  const environment: NodeJS.ProcessEnv = {
+    ...process.env,
+  };
+  const envPath = path.join(minerRoot(), ".env");
+
+  if (!fs.existsSync(envPath)) {
+    return environment;
+  }
+
+  const contents = fs.readFileSync(envPath, "utf8");
+
+  for (const sourceLine of contents.split(/\r?\n/)) {
+    const line = sourceLine.trim();
+
+    if (!line || line.startsWith("#")) {
+      continue;
+    }
+
+    const separator = line.indexOf("=");
+
+    if (separator <= 0) {
+      continue;
+    }
+
+    const key = line
+      .slice(0, separator)
+      .trim()
+      .replace(/^export\s+/, "");
+
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+      continue;
+    }
+
+    if (environment[key] !== undefined) {
+      continue;
+    }
+
+    let value = line.slice(separator + 1).trim();
+
+    if (
+      value.length >= 2 &&
+      ((value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'")))
+    ) {
+      value = value.slice(1, -1);
+    }
+
+    environment[key] = value;
+  }
+
+  return environment;
+}
+
 type RunOptions = {
   stdin?: string;
   timeoutMs?: number;
@@ -67,17 +135,18 @@ export async function runMinerJson<T>(
 ): Promise<T> {
   const executable = pythonExecutable();
   const cwd = slaiRoot();
+  const resolvedModuleName = runtimeModuleName(moduleName);
   const timeoutMs =
     options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
   return await new Promise<T>((resolve, reject) => {
     const child = spawn(
       executable,
-      ["-m", moduleName, ...args],
+      ["-m", resolvedModuleName, ...args],
       {
         cwd,
         env: {
-          ...process.env,
+          ...minerEnvironment(),
           PYTHONUNBUFFERED: "1",
         },
         shell: false,
