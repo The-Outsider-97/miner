@@ -8,18 +8,31 @@ from __future__ import annotations
 import argparse
 import json
 import uuid
+import sys
 
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from miner.artifact_builder import build_all, build_artifact
-from miner.benchmark_store import BenchmarkStore
-from miner.utils.config_loader import get_config_section
-from miner.utils.miner_errors import BenchmarkExecutionError, MinerConfigurationError, MinerError
-from miner.utils.miner_helpers import PROJECT_ROOT, require_external_repository, run_checked
-from miner.utils.repository_state import benchmark_database_path, dependency_status, repository_commits
+# Support the documented direct invocation from the repository root:
+#     uv run python slai_miner.py status
+#
+# The repository directory itself is the package root. When this file is run
+# directly, Python otherwise has no package context and relative imports fail.
+if __package__ in {None, ""}:
+    package_root = Path(__file__).resolve().parent
+    parent = str(package_root.parent)
+    if parent not in sys.path:
+        sys.path.insert(0, parent)
+    __package__ = package_root.name
+
+from .artifact_builder import build_all, build_artifact
+from .benchmark_store import BenchmarkStore
+from .utils.config_loader import get_config_section
+from .utils.miner_errors import BenchmarkExecutionError, MinerConfigurationError, MinerError
+from .utils.miner_helpers import PROJECT_ROOT, require_external_repository, run_checked
+from .utils.repository_state import benchmark_database_path, dependency_status, repository_commits
 
 _ARTIFACT_COMPONENTS = (
     "provider_routing",
@@ -37,7 +50,7 @@ def _store() -> BenchmarkStore:
 def _output_dir(label: str) -> Path:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     suffix = uuid.uuid4().hex[:8]
-    path = PROJECT_ROOT / "miner/benchmarks/harnyx/results" / f"{stamp}-{suffix}-{label}"
+    path = PROJECT_ROOT / "benchmarks/harnyx/results" / f"{stamp}-{suffix}-{label}"
     path.mkdir(parents=True, exist_ok=False)
     return path
 
@@ -328,7 +341,7 @@ def main(argv: list[str] | None = None) -> int:
                     disabled_components=tuple(args.disable),
                 ).to_dict()
         elif args.command == "slai-smoke":
-            from miner.adapters.slai import SlaiRuntime
+            from .adapters.slai import SlaiRuntime
 
             agents = list(args.agent)
             if args.reason and "reasoning" not in agents:
