@@ -1,6 +1,6 @@
 import Image from "next/image";
 
-import remyMark from "./assets/remy3design-mark.png";
+import remyMark from "./assets/slaiminer-mark.png";
 
 const footerLinks = [
   { label: "TaoStats SN67", href: "https://taostats.io/subnets/67/statistics" },

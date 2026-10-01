@@ -6,7 +6,7 @@ import {
   useState,
 } from "react";
 
-import remyMark from "./assets/remy3design-mark.png";
+import remyMark from "./assets/slaiminer-mark.png";
 import { useTao } from "./TaoContext";
 import type { TaoCurrency } from "./types";
 
