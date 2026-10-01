@@ -24,6 +24,24 @@ const STORAGE_KEY =
 const CURRENCIES: readonly TaoCurrency[] =
   ["USD", "EUR", "GBP", "BTC"];
 
+const PROVIDERS: Record<
+  string,
+  { label: string; href: string }
+> = {
+  cryptoapis: {
+    label: "Crypto APIs",
+    href: "https://cryptoapis.io/",
+  },
+  freecryptoapi: {
+    label: "FreeCryptoAPI",
+    href: "https://freecryptoapi.com/",
+  },
+  coinapi: {
+    label: "CoinAPI",
+    href: "https://www.apibricks.io/products/coin-api",
+  },
+};
+
 function displayPrice(
   raw: string,
   currency: TaoCurrency,
@@ -111,6 +129,10 @@ export function Header({
           rawPrice,
           currency,
         );
+
+  const provider = market?.provider
+    ? PROVIDERS[market.provider]
+    : undefined;
 
   return (
     <header
@@ -211,14 +233,20 @@ export function Header({
               </select>
             </label>
 
-            <a
-              className="tao-price__source"
-              href="https://www.coingecko.com/"
-              target="_blank"
-              rel="noreferrer"
-            >
-              CoinGecko
-            </a>
+            {provider ? (
+              <a
+                className="tao-price__source"
+                href={provider.href}
+                target="_blank"
+                rel="noreferrer"
+              >
+                {provider.label}
+              </a>
+            ) : (
+              <span className="tao-price__source">
+                Price provider
+              </span>
+            )}
 
             {market?.status ===
             "stale" ? (
