@@ -6,7 +6,6 @@ import sqlite3
 import time
 
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 from ..utils.config_loader import get_config_section

@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from benchmark_store import BenchmarkStore
-from dashboard_api import _benchmark_snapshot, build_dashboard_snapshot
+from miner.benchmark_store import BenchmarkStore
+from miner.dashboard_api import _benchmark_snapshot, build_dashboard_snapshot
 
 
 def _local_eval_report() -> dict:

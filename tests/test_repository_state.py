@@ -1,4 +1,4 @@
-from utils.repository_state import benchmark_database_path, dependency_status
+from miner.utils.repository_state import benchmark_database_path, dependency_status
 
 
 def test_configured_dependency_revisions_match_checked_out_submodules():

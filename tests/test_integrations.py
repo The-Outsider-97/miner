@@ -3,13 +3,13 @@ from pathlib import Path
 
 import pytest
 
-from artifact_builder import build_artifact
+from miner.artifact_builder import build_artifact
 
 
 @pytest.mark.integration
 @pytest.mark.skipif(os.environ.get("RUN_SLAI_INTEGRATION")!="1",reason="full SLAI dependency environment not requested")
 def test_reasoning_agent_starts_via_factory_and_closes():
-    from adapters.slai import SlaiRuntime
+    from miner.adapters.slai import SlaiRuntime
     with SlaiRuntime(["reasoning"]) as runtime:
         result=runtime.reason("If A implies B and A is true, what follows?")
         snapshot=runtime.snapshot()

@@ -3,8 +3,8 @@ from pathlib import Path
 
 import pytest
 
-from benchmark_store import BenchmarkStore
-from utils.miner_errors import BenchmarkExecutionError
+from miner.benchmark_store import BenchmarkStore
+from miner.utils.miner_errors import BenchmarkExecutionError
 
 
 def _report():

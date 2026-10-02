@@ -35,7 +35,6 @@ def test_coinapi_parser_requires_all_requested_currencies() -> None:
             {"asset_id_quote": "USD", "rate": 100, "time": "2026-09-30T20:00:00Z"},
             {"asset_id_quote": "EUR", "rate": 90, "time": "2026-09-30T20:00:01Z"},
             {"asset_id_quote": "GBP", "rate": 80, "time": "2026-09-30T20:00:02Z"},
-            {"asset_id_quote": "BTC", "rate": 0.001, "time": "2026-09-30T20:00:03Z"},
         ]
     }
     prices, updated = tao_market._parse_coinapi(json.dumps(payload), tao_market._SUPPORTED)
@@ -43,7 +42,6 @@ def test_coinapi_parser_requires_all_requested_currencies() -> None:
         "USD": "100",
         "EUR": "90",
         "GBP": "80",
-        "BTC": "0.001",
     }
     assert updated == "2026-09-30T20:00:00+00:00"
 

@@ -9,7 +9,6 @@ market:
     - USD
     - EUR
     - GBP
-    - BTC
 
   # Providers are used round-robin. The next provider and next refresh time are
   # persisted in state/tao_market_cache.json so restarts do not reset rotation.

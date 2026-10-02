@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from utils.config_loader import get_config_section, load_config
+from miner.utils.config_loader import get_config_section, load_config
 
 ROOT=Path(__file__).resolve().parents[1]
 

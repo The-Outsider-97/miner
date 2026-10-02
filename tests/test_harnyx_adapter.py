@@ -1,9 +1,9 @@
 import pytest
 
-from adapters.harnyx import CitationRef, ContextSnapshot, Query, build_response, normalize_request
+from miner.adapters.harnyx import CitationRef, ContextSnapshot, Query, build_response, normalize_request
 from harnyx_miner_sdk.tools.http_models import ToolBudgetDTO
 from harnyx_miner_sdk.tools.time_budget import ExecutionTimeBudgetDTO
-from utils.miner_errors import CitationValidationError, StructuredOutputError
+from miner.utils.miner_errors import CitationValidationError, StructuredOutputError
 
 
 def _context():

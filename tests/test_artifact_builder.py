@@ -1,7 +1,7 @@
 import hashlib
 from pathlib import Path
 
-from artifact_builder import _max_agent_bytes, build_artifact
+from miner.artifact_builder import _max_agent_bytes, build_artifact
 
 
 def test_build_is_byte_deterministic(tmp_path: Path):

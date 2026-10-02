@@ -3,8 +3,8 @@ from pathlib import Path
 
 import pytest
 
-from slai_miner import _parser, _report_path, _summary
-from utils.miner_errors import BenchmarkExecutionError
+from miner.slai_miner import _parser, _report_path, _summary
+from miner.utils.miner_errors import BenchmarkExecutionError
 
 
 def test_summary_parses_current_compact_harnyx_stdout():
