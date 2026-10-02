@@ -10,6 +10,8 @@ import { SidePanel } from "./SidePanel";
 import { Table, type TableColumn } from "./Table";
 import type { BenchmarkRun, DashboardSnapshot, RuntimeMeasurement, SectionDefinition } from "./types";
 
+const DASHBOARD_REFRESH_MS = 10_000;
+
 const sections: readonly SectionDefinition[] = [
   { id: "overview", label: "Overview" },
   { id: "artifact", label: "Artifact" },
@@ -62,22 +64,48 @@ export default function DashboardApp() {
 
   useEffect(() => {
     const controller = new AbortController();
-    setLoading(true); setError(null);
-    fetch("/api/dashboard", { cache: "no-store", signal: controller.signal })
-      .then(async (response) => {
+    let requestInFlight = false;
+
+    const loadDashboard = async (showLoading: boolean) => {
+      if (requestInFlight) return;
+      requestInFlight = true;
+
+      if (showLoading) setLoading(true);
+      setError(null);
+
+      try {
+        const response = await fetch("/api/dashboard", {
+          cache: "no-store",
+          signal: controller.signal,
+        });
+
         if (!response.ok) {
           const body = await response.json().catch(() => null) as { error?: string } | null;
           throw new Error(body?.error ?? `Dashboard request failed (${response.status}).`);
         }
-        return response.json() as Promise<DashboardSnapshot>;
-      })
-      .then(setData)
-      .catch((reason: unknown) => {
+
+        const snapshot = await response.json() as DashboardSnapshot;
+        setData(snapshot);
+      } catch (reason: unknown) {
         if (reason instanceof DOMException && reason.name === "AbortError") return;
+        setData(null);
         setError(reason instanceof Error ? reason.message : "Dashboard data could not be loaded.");
-      })
-      .finally(() => { if (!controller.signal.aborted) setLoading(false); });
-    return () => controller.abort();
+      } finally {
+        requestInFlight = false;
+        if (showLoading && !controller.signal.aborted) setLoading(false);
+      }
+    };
+
+    void loadDashboard(true);
+    const interval = window.setInterval(
+      () => void loadDashboard(false),
+      DASHBOARD_REFRESH_MS,
+    );
+
+    return () => {
+      window.clearInterval(interval);
+      controller.abort();
+    };
   }, [refresh]);
 
   useEffect(() => {
@@ -97,6 +125,7 @@ export default function DashboardApp() {
   }, [panelOpen]);
 
   const top = useCallback(() => window.scrollTo({ top: 0, behavior: "smooth" }), []);
+  const isMining = data?.mining.active === true && data.mining.status === "mining";
 
   const runColumns = useMemo<readonly TableColumn<BenchmarkRun>[]>(() => [
     { key: "strategy", header: "Strategy", render: (run) => <strong>{run.strategy ?? "—"}</strong> },
@@ -115,7 +144,7 @@ export default function DashboardApp() {
   ], []);
 
   return <div className="site-shell">
-    <Header panelOpen={panelOpen} onTogglePanel={() => setPanelOpen((value) => !value)} onTop={top} />
+    <Header panelOpen={panelOpen} onTogglePanel={() => setPanelOpen((value) => !value)} onTop={top} isMining={isMining} />
     <SidePanel open={panelOpen} sections={sections} activeSection={activeSection} data={data} onClose={() => setPanelOpen(false)} />
 
     <div className="dashboard-column">
@@ -153,7 +182,7 @@ export default function DashboardApp() {
               <div className="integration-card"><div className="integration-card__head"><h3>SLAI v2.3</h3><Status value={data.slai.status} /></div><dl className="detail-list detail-list--compact"><Detail label="Commit"><code>{hash(data.slai.commit)}</code></Detail><Detail label="Pin state"><Status value={data.slai.pinned ? "ready" : "unavailable"} text={data.slai.pinned ? "Pinned" : "Mismatch / unavailable"} /></Detail><Detail label="Runtime evidence">{data.slai.runtime_evidence === "recorded" ? "Recorded" : "Not recorded"}</Detail></dl></div>
               <div className="integration-card"><div className="integration-card__head"><h3>Harnyx</h3><Status value={data.harnyx.status} /></div><dl className="detail-list detail-list--compact"><Detail label="SDK">{data.harnyx.sdk_version || "Not available"}</Detail><Detail label="Commit"><code>{hash(data.harnyx.commit)}</code></Detail><Detail label="Pin state"><Status value={data.harnyx.pinned ? "ready" : "unavailable"} text={data.harnyx.pinned ? "Pinned" : "Mismatch / unavailable"} /></Detail></dl></div>
             </div>
-            <div className="subsection"><div className="subsection__heading"><h3>Selected SLAI agents</h3><p>Only persisted runtime use is shown.</p></div>{data.slai.selected_agents.length ? <div className="component-list">{data.slai.selected_agents.map((agent) => <span className="component-chip" data-state="ready" key={agent}>{agent}</span>)}</div> : <Empty>No selected SLAI agents have been persisted for the latest run.</Empty>}</div>
+            <div className="subsection"><div className="subsection__heading"><h3>Selected SLAI agents</h3><p>Only persisted runtime use is shown.</p></div>{data.slai.selected_agents.length ? <div className="component-list">{data.slai.selected_agents.map((agent) => <span className="component-chip" data-state="ready" key={agent}>{agent}</span>) : <Empty>No selected SLAI agents have been persisted for the latest run.</Empty>}</div>
             <div className="subsection"><div className="subsection__heading"><h3>Recorded SLAI agent latency</h3><p>Candidate agents are not presented as used agents.</p></div><Table columns={agentColumns} rows={data.slai.runtime_measurements} getRowKey={(row, index) => `${row.agent ?? "agent"}-${row.operation ?? "operation"}-${index}`} emptyMessage="No persisted SLAI agent invocation measurements are available yet." caption="Recorded SLAI agent invocation latency" /></div>
           </div></section>
 
@@ -174,7 +203,7 @@ export default function DashboardApp() {
           </div></section>
         </> : null}
       </main>
-      <Footer />
+      <Footer isMining={isMining} />
     </div>
   </div>;
 }
