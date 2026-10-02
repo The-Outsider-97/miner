@@ -1,5 +1,6 @@
 "use client";
 
+import type { ChangeEvent } from "react";
 import Image from "next/image";
 
 import harnyxMark from "./assets/harnyx-mark.png";
@@ -58,15 +59,6 @@ function quoteValue(
   }
 
   const value = tao * quote;
-
-  if (currency === "BTC") {
-    return `${value.toLocaleString(
-      "en-US",
-      {
-        maximumFractionDigits: 8,
-      },
-    )} BTC`;
-  }
 
   return new Intl.NumberFormat(
     "en-US",
@@ -269,9 +261,6 @@ export function SidePanel({
                   GBP
                 </option>
 
-                <option value="BTC">
-                  BTC
-                </option>
               </select>
             </div>
 

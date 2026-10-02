@@ -26,7 +26,6 @@ const SUPPORTED: readonly TaoCurrency[] = [
   "USD",
   "EUR",
   "GBP",
-  "BTC",
 ];
 
 type TaoContextValue = {

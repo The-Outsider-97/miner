@@ -22,7 +22,7 @@ const STORAGE_KEY =
   "slai-miner-theme";
 
 const CURRENCIES: readonly TaoCurrency[] =
-  ["USD", "EUR", "GBP", "BTC"];
+  ["USD", "EUR", "GBP"];
 
 const PROVIDERS: Record<
   string,
@@ -50,15 +50,6 @@ function displayPrice(
 
   if (!Number.isFinite(value)) {
     return "Unavailable";
-  }
-
-  if (currency === "BTC") {
-    return `${value.toLocaleString(
-      "en-US",
-      {
-        maximumFractionDigits: 8,
-      },
-    )} BTC`;
   }
 
   return new Intl.NumberFormat(

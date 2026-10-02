@@ -110,8 +110,7 @@ export type SectionDefinition = {
 export type TaoCurrency =
   | "USD"
   | "EUR"
-  | "GBP"
-  | "BTC";
+  | "GBP";
 
 export type TaoMarketState = {
   status:
