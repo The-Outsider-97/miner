@@ -9,13 +9,33 @@ type DashboardResponse = {
   schema?: unknown;
 };
 
+type MiningResponse = {
+  status?: unknown;
+  active?: unknown;
+};
+
+const unknownMiningState = {
+  status: "unknown",
+  active: false,
+  batch_id: null,
+  batch_status: null,
+  artifact_id: null,
+  source: "harnyx_public_monitoring",
+  checked_at: null,
+} as const;
+
 export async function GET() {
   try {
-    const data =
-      await runMinerJson<DashboardResponse>(
+    const [data, mining] = await Promise.all([
+      runMinerJson<DashboardResponse>(
         "miner.dashboard_api",
         ["--json"],
-      );
+      ),
+      runMinerJson<MiningResponse>(
+        "miner.mining_status_api",
+        ["--json"],
+      ).catch(() => unknownMiningState),
+    ]);
 
     if (data.schema !== "slai-miner-dashboard-v1") {
       throw new Error(
@@ -23,11 +43,26 @@ export async function GET() {
       );
     }
 
-    return NextResponse.json(data, {
-      headers: {
-        "Cache-Control": "no-store",
+    const safeMining =
+      mining.active === true &&
+      mining.status === "mining"
+        ? mining
+        : {
+            ...mining,
+            active: false,
+          };
+
+    return NextResponse.json(
+      {
+        ...data,
+        mining: safeMining,
       },
-    });
+      {
+        headers: {
+          "Cache-Control": "no-store",
+        },
+      },
+    );
   } catch {
     return NextResponse.json(
       {

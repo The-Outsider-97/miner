@@ -1,12 +1,11 @@
 "use client";
 
-import Image from "next/image";
 import {
   useEffect,
   useState,
 } from "react";
 
-import remyMark from "./assets/slaiminer-mark.png";
+import { MinerMark } from "./MinerMark";
 import { useTao } from "./TaoContext";
 import type { TaoCurrency } from "./types";
 
@@ -16,6 +15,7 @@ type Props = {
   panelOpen: boolean;
   onTogglePanel: () => void;
   onTop: () => void;
+  isMining: boolean;
 };
 
 const STORAGE_KEY =
@@ -66,6 +66,7 @@ export function Header({
   panelOpen,
   onTogglePanel,
   onTop,
+  isMining,
 }: Props) {
   const [theme, setTheme] =
     useState<Theme>("dark");
@@ -155,9 +156,8 @@ export function Header({
             aria-label="Return to top"
             onClick={onTop}
           >
-            <Image
-              src={remyMark}
-              alt=""
+            <MinerMark
+              isMining={isMining}
               priority
             />
 
