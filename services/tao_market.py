@@ -14,10 +14,12 @@ from typing import Any, Callable
 
 import httpx  # type: ignore
 
-from ..utils.config_loader import get_config_section
-from ..utils.miner_helpers import PROJECT_ROOT
+from ..utils.config_loader import get_config_section  # type: ignore
+from ..utils.miner_helpers import PROJECT_ROOT  # type: ignore
 
-_SUPPORTED = ("USD", "EUR", "GBP", "BTC")
+_SUPPORTED = ("USD", "EUR", "GBP",
+              # "BTC"
+              )
 _PROVIDER_ORDER = ("cryptoapis", "freecryptoapi", "coinapi")
 
 
@@ -53,7 +55,7 @@ def _settings() -> dict[str, Any]:
     config = get_config_section("market")
     currencies = tuple(str(item).upper() for item in config.get("currencies", _SUPPORTED))
     if currencies != _SUPPORTED:
-        raise ValueError("market.currencies must be exactly USD, EUR, GBP, BTC")
+        raise ValueError("market.currencies must be exactly USD, EUR, GBP")
 
     refresh_min = int(config.get("refresh_min_seconds") or 180)
     refresh_max = int(config.get("refresh_max_seconds") or 300)
