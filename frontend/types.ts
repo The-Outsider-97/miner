@@ -57,6 +57,16 @@ export type PerformanceState = {
   structured_output_failure_rate: number | null;
 };
 
+export type MiningState = {
+  status: "mining" | "initializing" | "inactive" | "unknown" | string;
+  active: boolean;
+  batch_id: string | null;
+  batch_status: string | null;
+  artifact_id: string | null;
+  source: string;
+  checked_at: string | null;
+};
+
 export type DashboardSnapshot = {
   schema: string;
   generated_at: string;
@@ -66,6 +76,7 @@ export type DashboardSnapshot = {
     data_source: string;
     message: string | null;
   };
+  mining: MiningState;
   artifact: ArtifactState | null;
   slai: {
     status: StatusState;
