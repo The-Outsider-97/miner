@@ -1,6 +1,4 @@
-import Image from "next/image";
-
-import remyMark from "./assets/slaiminer-mark.png";
+import { MinerMark } from "./MinerMark";
 
 const footerLinks = [
   { label: "TaoStats SN67", href: "https://taostats.io/subnets/67/statistics" },
@@ -10,12 +8,16 @@ const footerLinks = [
   { label: "Bittensor Docs", href: "https://docs.bittensor.com/" },
 ] as const;
 
-export function Footer() {
+type Props = {
+  isMining: boolean;
+};
+
+export function Footer({ isMining }: Props) {
   return (
     <footer className="site-footer">
       <div className="site-footer__top">
         <div className="footer-brand">
-          <Image src={remyMark} alt="" />
+          <MinerMark isMining={isMining} />
           <div>
             <strong>SLAI Miner SN67</strong>
             <span>Harnyx research-miner engineering dashboard</span>
