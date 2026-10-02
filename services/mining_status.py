@@ -23,20 +23,27 @@ def mining_status_snapshot(
     uploads: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Return fail-closed mining state from Harnyx public batch monitoring."""
-    recorded_uploads = tuple(uploads) if uploads is not None else _recorded_uploads()
+    try:
+        recorded_uploads = tuple(uploads) if uploads is not None else _recorded_uploads()
+    except Exception:
+        return _snapshot("unknown")
+
     if not recorded_uploads:
         return _snapshot("inactive")
 
     owns_client = client is None
     if client is None:
-        base_url = _platform_base_url()
-        if base_url is None:
+        try:
+            base_url = _platform_base_url()
+            if base_url is None:
+                return _snapshot("unknown")
+            client = httpx.Client(
+                base_url=base_url,
+                timeout=_request_timeout_seconds(),
+                follow_redirects=True,
+            )
+        except (OSError, TypeError, ValueError):
             return _snapshot("unknown")
-        client = httpx.Client(
-            base_url=base_url,
-            timeout=_request_timeout_seconds(),
-            follow_redirects=True,
-        )
 
     try:
         return _remote_snapshot(client, recorded_uploads)
