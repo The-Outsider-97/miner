@@ -57,6 +57,127 @@ export type PerformanceState = {
   structured_output_failure_rate: number | null;
 };
 
+export type MiningRegistrationState = {
+  status: "registered" | "not_registered" | "unknown" | string;
+  netuid: number | null;
+  uid: number | null;
+  hotkey_ss58: string | null;
+  network: string | null;
+  source: string;
+};
+
+export type MiningAuthState = {
+  status: "authenticated" | "not_authenticated" | "error" | "unknown" | string;
+  uid: number | null;
+  hotkey_ss58: string | null;
+  message: string | null;
+};
+
+export type MiningProviderState = {
+  status: "ready" | "not_ready" | "unknown" | string;
+  required: string[];
+  configured: string[];
+  missing: string[];
+  requirements_complete: boolean;
+};
+
+export type MiningArtifactLifecycle = {
+  status: "submitted" | "unknown" | string;
+  acceptance: "accepted" | "unverified" | "rejected" | "unknown" | string;
+  artifact_id: string | null;
+  content_hash: string | null;
+  submitted_at: string | null;
+  uid: number | null;
+  filename: string | null;
+  size_bytes: number | null;
+  candidate_status: "current_candidate" | "moved_to_batch" | "not_current" | "unknown" | string;
+};
+
+export type MiningSchedulerState = {
+  status: "scheduled" | "disabled" | "unknown" | string;
+  next_scheduled_batch_at: string | null;
+  cron: string | null;
+  evaluation_timeout_seconds: number | null;
+  validator_health: {
+    healthy: number | null;
+    unhealthy: number | null;
+    unknown: number | null;
+  };
+};
+
+export type MiningBatchState = {
+  batch_id: string;
+  status: string;
+  evaluation_stage: string | null;
+  created_at: string | null;
+  cutoff_at: string | null;
+  completed_at: string | null;
+  failed_at: string | null;
+  artifact_count: number | null;
+  task_count: number | null;
+  qualifying_task_count: number | null;
+  main_task_count: number | null;
+  champion_artifact_id: string | null;
+  stage_progress: Record<string, unknown> | null;
+};
+
+export type MiningValidatorExecutionState = {
+  status: "running" | "completed" | "batch_running_unconfirmed" | "pending" | "unknown" | string;
+  validator_count: number | null;
+  resolved_count: number | null;
+  total_count: number | null;
+  percent_complete: number | null;
+  started_at: string | null;
+  stage: string | null;
+};
+
+export type MiningEvaluationState = {
+  qualifying_status: string;
+  main_status: string;
+  main_admitted: boolean | null;
+  final_status: string;
+  qualifying_score: number | null;
+  total_score: number | null;
+  comparison_score: number | null;
+  median_cost_usd: number | null;
+  total_cost_usd: number | null;
+  median_runtime_ms: number | null;
+  novelty_classification: string | null;
+  error_counts: Record<string, number> | null;
+  source: string;
+};
+
+export type MiningAllocationState = {
+  status: string;
+  reward_eligible: boolean | null;
+  weight: number | null;
+  source_batch_id: string | null;
+  source: string;
+};
+
+export type MiningOnchainState = {
+  status: "confirmed" | "emitting" | "unavailable" | "unknown" | string;
+  netuid: number | null;
+  weight_submitted: boolean | null;
+  incentive: number | null;
+  emission_tao: number | null;
+  rank: number | null;
+  trust: number | null;
+  consensus: number | null;
+  stake: number | null;
+  last_update: number | string | null;
+  source: string;
+  message: string | null;
+};
+
+export type MiningSummary = {
+  title: string;
+  detail: string;
+  next_step: string;
+  batch_id: string | null;
+  artifact_id: string | null;
+};
+
 export type MiningState = {
   status: "mining" | "initializing" | "inactive" | "unknown" | string;
   active: boolean;
@@ -65,6 +186,19 @@ export type MiningState = {
   artifact_id: string | null;
   source: string;
   checked_at: string | null;
+  phase: string;
+  summary: MiningSummary;
+  registration: MiningRegistrationState;
+  harnyx_auth: MiningAuthState;
+  providers: MiningProviderState;
+  artifact: MiningArtifactLifecycle | null;
+  scheduler: MiningSchedulerState;
+  batch: MiningBatchState | null;
+  validator_execution: MiningValidatorExecutionState;
+  evaluation: MiningEvaluationState;
+  allocation: MiningAllocationState;
+  onchain: MiningOnchainState;
+  errors: string[];
 };
 
 export type DashboardSnapshot = {
@@ -116,7 +250,6 @@ export type SectionDefinition = {
   id: string;
   label: string;
 };
-
 
 export type TaoCurrency =
   | "USD"
