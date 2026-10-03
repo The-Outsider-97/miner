@@ -11,6 +11,8 @@ def _client(
     artifact_id: str = "artifact-1",
     response_status: int = 200,
 ) -> httpx.Client:
+    content_hash = "artifact-hash" if artifact_id == "artifact-1" else "other-hash"
+
     def handler(request: httpx.Request) -> httpx.Response:
         if response_status != 200:
             return httpx.Response(response_status, json={"detail": "unavailable"})
@@ -41,7 +43,7 @@ def _client(
                         "artifacts": [
                             {
                                 "artifact_id": artifact_id,
-                                "content_hash": "artifact-hash",
+                                "content_hash": content_hash,
                             }
                         ]
                     },
@@ -164,6 +166,47 @@ def test_current_submission_is_distinct_from_batch_selection() -> None:
     assert snapshot["artifact"]["candidate_status"] == "current_candidate"
     assert snapshot["batch"] is None
     assert snapshot["validator_execution"]["status"] == "not_started"
+
+
+def test_current_candidate_does_not_inherit_older_running_batch() -> None:
+    uploads = (
+        {
+            "platform_artifact_id": "artifact-old",
+            "platform_content_hash": "old-hash",
+            "submitted_at": "2026-10-02T12:00:00Z",
+        },
+        {
+            "platform_artifact_id": "artifact-new",
+            "platform_content_hash": "new-hash",
+            "submitted_at": "2026-10-02T20:37:06Z",
+        },
+    )
+    tools = _mcp_tools()
+    tools["get_latest_submissions"] = {
+        "rows": [
+            {
+                "uid": 200,
+                "artifact_id": "artifact-new",
+                "miner_hotkey_ss58": "5ExampleHotkey",
+                "content_hash": "new-hash",
+                "submitted_at": "2026-10-02T20:37:06Z",
+            }
+        ]
+    }
+
+    with _client(status="running", artifact_id="artifact-old") as client:
+        snapshot = mining_status_snapshot(
+            client=client,
+            uploads=uploads,
+            miner_config=_miner_config(),
+            mcp_tools=tools,
+        )
+
+    assert snapshot["phase"] == "candidate"
+    assert snapshot["artifact"]["artifact_id"] == "artifact-new"
+    assert snapshot["artifact"]["candidate_status"] == "current_candidate"
+    assert snapshot["batch"] is None
+    assert snapshot["active"] is False
 
 
 def test_scheduler_and_validator_health_are_normalized() -> None:
