@@ -11,6 +11,14 @@ import { SidePanel } from "./SidePanel";
 import { Table, type TableColumn } from "./Table";
 import type { BenchmarkRun, DashboardSnapshot, RuntimeMeasurement, SectionDefinition } from "./types";
 
+declare global {
+  namespace JSX {
+    interface IntrinsicElements {
+      [elemName: string]: any;
+    }
+  }
+}
+
 const DASHBOARD_REFRESH_MS = 30_000;
 
 const sections: readonly SectionDefinition[] = [
