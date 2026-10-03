@@ -18,12 +18,11 @@ from ..utils.miner_errors import MinerError
 from ..utils.miner_helpers import PROJECT_ROOT, require_external_repository, run_checked
 from .artifact_submission import list_artifact_candidates
 
-_ACTIVE_BATCH_STATUS = "running"
 _TRACKED_BATCH_STATUSES = frozenset(("initializing", "running"))
+_PROVIDER_CALLS = frozenset(("llm_chat", "search_web", "fetch_page", "embed_text"))
 _SOURCE = "harnyx_public_monitoring"
 _MCP_PROTOCOL_VERSION = "2025-06-18"
 _MCP_CLIENT_INFO = {"name": "slai-harnyx-miner-dashboard", "version": "0.1.0"}
-_PROVIDER_CALLS = frozenset(("llm_chat", "search_web", "fetch_page", "embed_text"))
 
 
 def mining_status_snapshot(
@@ -33,7 +32,7 @@ def mining_status_snapshot(
     miner_config: Mapping[str, Any] | None = None,
     mcp_tools: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Return one frontend-safe normalized snapshot of the production lifecycle."""
+    """Return a single frontend-safe lifecycle snapshot."""
     checked_at = datetime.now(timezone.utc).isoformat()
     errors: list[str] = []
 
@@ -43,10 +42,9 @@ def mining_status_snapshot(
         recorded_uploads = ()
         errors.append("Local submission history could not be read.")
 
-    project = get_config_section("project")
-    netuid = _int_or_none(project.get("netuid"))
+    netuid = _int_or_none(get_config_section("project").get("netuid"))
 
-    config_payload: Mapping[str, Any] | None = miner_config
+    config_payload = miner_config
     if config_payload is None:
         try:
             config_payload = _read_miner_config()
@@ -62,7 +60,7 @@ def mining_status_snapshot(
     owns_client = client is None
     if client is None:
         base_url = _platform_base_url()
-        if base_url is not None:
+        if base_url:
             try:
                 client = httpx.Client(
                     base_url=base_url,
@@ -73,28 +71,28 @@ def mining_status_snapshot(
                 client = None
                 errors.append("Harnyx public monitoring client could not be initialized.")
 
-    tool_payloads: dict[str, Mapping[str, Any]] = dict(mcp_tools or {})
+    tool_payloads = dict(mcp_tools or {})
     if not tool_payloads:
         base_url = _platform_base_url()
-        if base_url is not None:
+        if base_url:
             try:
                 tool_payloads = _public_mcp_snapshot(base_url)
             except (httpx.HTTPError, RuntimeError, ValueError, TypeError):
                 errors.append("Harnyx public monitoring MCP is unavailable.")
 
-    latest_submissions = _rows(tool_payloads.get("get_latest_submissions"), "rows")
-    validator_payload = _mapping(tool_payloads.get("get_validators"))
     candidate = _candidate_for_miner(
-        latest_submissions,
+        _rows(tool_payloads.get("get_latest_submissions"), "rows"),
         hotkey_ss58=_text(harnyx_auth.get("hotkey_ss58")),
         uid=_int_or_none(harnyx_auth.get("uid")),
         uploads=recorded_uploads,
     )
-
     target = _target_identity(candidate, recorded_uploads, harnyx_auth)
+
     local_artifact = _local_artifact_for_hash(_text(target.get("content_hash")))
-    required_providers = _artifact_required_providers(local_artifact)
-    providers = _complete_provider_state(providers, required_providers)
+    providers = _complete_provider_state(
+        providers,
+        _artifact_required_providers(local_artifact),
+    )
 
     remote: dict[str, Any] = {}
     remote_error = False
@@ -111,9 +109,14 @@ def mining_status_snapshot(
 
     batch = _mapping(remote.get("batch"))
     matched_artifact = _mapping(remote.get("matched_artifact"))
-
-    candidate_status = "current_candidate" if candidate else (
-        "moved_to_batch" if batch else ("unknown" if harnyx_auth.get("status") != "authenticated" else "not_current")
+    candidate_status = (
+        "current_candidate"
+        if candidate
+        else "moved_to_batch"
+        if batch
+        else "unknown"
+        if harnyx_auth.get("status") != "authenticated"
+        else "not_current"
     )
 
     artifact = _artifact_state(
@@ -125,26 +128,24 @@ def mining_status_snapshot(
         recorded_uploads=recorded_uploads,
         candidate_status=candidate_status,
     )
-
-    scheduler = _scheduler_state(validator_payload)
+    scheduler = _scheduler_state(_mapping(tool_payloads.get("get_validators")))
     validator_execution = _validator_execution_state(batch, matched_artifact)
 
     comparison: Mapping[str, Any] = {}
     batch_id = _text(batch.get("batch_id"))
     artifact_id = _text(artifact.get("artifact_id"))
     if batch_id and artifact_id and _text(batch.get("status")).lower() == "completed":
-        if "get_miner_task_batch_artifact_comparison" in tool_payloads:
-            comparison = _mapping(tool_payloads.get("get_miner_task_batch_artifact_comparison"))
+        injected = tool_payloads.get("get_miner_task_batch_artifact_comparison")
+        if isinstance(injected, Mapping):
+            comparison = injected
         else:
             base_url = _platform_base_url()
-            if base_url is not None:
+            if base_url:
                 try:
-                    comparison = _mapping(
-                        _mcp_artifact_comparison(
-                            base_url,
-                            batch_id=batch_id,
-                            artifact_id=artifact_id,
-                        )
+                    comparison = _mcp_artifact_comparison(
+                        base_url,
+                        batch_id=batch_id,
+                        artifact_id=artifact_id,
                     )
                 except (httpx.HTTPError, RuntimeError, ValueError, TypeError):
                     errors.append("Harnyx finalized artifact comparison is unavailable.")
@@ -152,7 +153,6 @@ def mining_status_snapshot(
     evaluation = _evaluation_state(batch, matched_artifact, comparison)
     allocation = _allocation_state(comparison)
     onchain = _onchain_state(netuid=netuid)
-
     phase = _phase(
         registration=registration,
         harnyx_auth=harnyx_auth,
@@ -166,9 +166,10 @@ def mining_status_snapshot(
     )
 
     coarse_status = "inactive"
-    if _text(batch.get("status")).lower() == "initializing":
+    batch_status = _text(batch.get("status")).lower()
+    if batch_status == "initializing":
         coarse_status = "initializing"
-    elif _text(batch.get("status")).lower() == "running":
+    elif batch_status == "running":
         coarse_status = "mining"
     elif remote_error and recorded_uploads:
         coarse_status = "unknown"
@@ -197,10 +198,8 @@ def mining_status_snapshot(
         "onchain": onchain,
         "errors": errors,
     }
-
     if owns_client and client is not None:
         client.close()
-
     return response
 
 
@@ -219,48 +218,48 @@ def _remote_lifecycle(
     if not isinstance(payload, Mapping):
         raise ValueError("Harnyx monitoring response must be a JSON object.")
 
-    batches = _sequence(payload.get("batches"))
-    active: list[Mapping[str, Any]] = []
-    completed: list[Mapping[str, Any]] = []
-    for raw in batches:
-        if not isinstance(raw, Mapping):
-            continue
-        status = _text(raw.get("status")).lower()
-        if status in _TRACKED_BATCH_STATUSES:
-            active.append(raw)
-        elif status in {"completed", "failed"}:
-            completed.append(raw)
-
+    batches = [
+        item
+        for item in _sequence(payload.get("batches"))
+        if isinstance(item, Mapping)
+    ]
+    active = [
+        item for item in batches
+        if _text(item.get("status")).lower() in _TRACKED_BATCH_STATUSES
+    ]
+    completed = [
+        item for item in batches
+        if _text(item.get("status")).lower() in {"completed", "failed"}
+    ]
     hotkey = _text(target.get("miner_hotkey_ss58"))
     uid = _int_or_none(target.get("uid"))
 
-    for raw_batch in active:
+    for summary in active:
         match = _batch_match(
             client,
-            raw_batch,
-            target,
-            uploads,
+            summary,
+            target=target,
+            uploads=uploads,
             hotkey=hotkey,
             uid=uid,
             allow_identity_fallback=True,
         )
-        if match is not None:
+        if match:
             return match
 
-    for raw_batch in completed[: _completed_scan_limit()]:
-        if not (_text(target.get("artifact_id")) or _text(target.get("content_hash"))):
-            break
-        match = _batch_match(
-            client,
-            raw_batch,
-            target,
-            uploads,
-            hotkey=hotkey,
-            uid=uid,
-            allow_identity_fallback=False,
-        )
-        if match is not None:
-            return match
+    if _text(target.get("artifact_id")) or _text(target.get("content_hash")):
+        for summary in completed[: _completed_scan_limit()]:
+            match = _batch_match(
+                client,
+                summary,
+                target=target,
+                uploads=uploads,
+                hotkey=hotkey,
+                uid=uid,
+                allow_identity_fallback=False,
+            )
+            if match:
+                return match
 
     return {}
 
@@ -268,9 +267,9 @@ def _remote_lifecycle(
 def _batch_match(
     client: httpx.Client,
     summary: Mapping[str, Any],
+    *,
     target: Mapping[str, Any],
     uploads: Sequence[Mapping[str, Any]],
-    *,
     hotkey: str,
     uid: int | None,
     allow_identity_fallback: bool,
@@ -297,17 +296,11 @@ def _batch_match(
         return None
 
     normalized = dict(summary)
-    detail_summary = _mapping(detail.get("summary"))
-    for key, value in detail_summary.items():
+    for key, value in _mapping(detail.get("summary")).items():
         if value is not None:
             normalized[key] = value
-    normalized["detail_source"] = "harnyx_public_monitoring"
-    normalized["stage_progress"] = normalized.get("stage_progress") or detail_summary.get("stage_progress")
-
-    return {
-        "batch": normalized,
-        "matched_artifact": dict(matched),
-    }
+    normalized["detail_source"] = _SOURCE
+    return {"batch": normalized, "matched_artifact": dict(matched)}
 
 
 def _matching_artifact(
@@ -323,22 +316,29 @@ def _matching_artifact(
     if not artifacts:
         return None
 
-    artifact_ids = {
-        value
-        for value in (
-            _text(target.get("artifact_id")),
-            *(_text(upload.get("platform_artifact_id")) for upload in uploads),
-        )
-        if value
-    }
-    hashes = {
-        value.lower()
-        for value in (
-            _text(target.get("content_hash")),
-            *(_text(upload.get("platform_content_hash")) for upload in uploads),
-        )
-        if value
-    }
+    target_artifact_id = _text(target.get("artifact_id"))
+    target_content_hash = _text(target.get("content_hash")).lower()
+    artifact_ids = {target_artifact_id} if target_artifact_id else set()
+    hashes = {target_content_hash} if target_content_hash else set()
+
+    # Never associate a current candidate with an older artifact from the same
+    # hotkey. Historical uploads are only a fallback when no current artifact
+    # identity is available at all.
+    if not artifact_ids and not hashes:
+        artifact_ids = {
+            value
+            for value in (
+                _text(item.get("platform_artifact_id")) for item in uploads
+            )
+            if value
+        }
+        hashes = {
+            value.lower()
+            for value in (
+                _text(item.get("platform_content_hash")) for item in uploads
+            )
+            if value
+        }
 
     for artifact in artifacts:
         artifact_id = _text(artifact.get("artifact_id"))
@@ -348,28 +348,23 @@ def _matching_artifact(
         if content_hash and content_hash in hashes:
             return artifact
 
-    if not allow_identity_fallback:
+    if artifact_ids or hashes or not allow_identity_fallback:
         return None
 
     if hotkey:
         for artifact in artifacts:
             if _text(artifact.get("miner_hotkey_ss58")) == hotkey:
                 return artifact
-
     if uid is not None:
         for artifact in artifacts:
             if _int_or_none(artifact.get("uid")) == uid:
                 return artifact
-
     return None
 
 
 def _artifact_rows(detail: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
-    candidates: list[object] = []
     batch = _mapping(detail.get("batch"))
-    candidates.append(batch.get("artifacts"))
-    candidates.append(detail.get("artifacts"))
-    for value in candidates:
+    for value in (batch.get("artifacts"), detail.get("artifacts")):
         rows = _sequence(value)
         if rows:
             return tuple(item for item in rows if isinstance(item, Mapping))
@@ -382,98 +377,41 @@ def _identity_and_provider_state(
     netuid: int | None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     if config is None:
-        registration = {
-            "status": "unknown",
-            "netuid": netuid,
-            "uid": None,
-            "hotkey_ss58": None,
-            "network": None,
-            "source": "harnyx_miner_config",
-        }
-        auth = {
-            "status": "unknown",
-            "uid": None,
-            "hotkey_ss58": None,
-            "message": "Authenticated Harnyx miner configuration is unavailable.",
-        }
-        providers = {
-            "status": "unknown",
-            "required": [],
-            "configured": [],
-            "missing": [],
-            "requirements_complete": False,
-        }
-        return registration, auth, providers
+        return (
+            {"status": "unknown", "netuid": netuid, "uid": None, "hotkey_ss58": None, "network": None, "source": "harnyx_miner_config"},
+            {"status": "unknown", "uid": None, "hotkey_ss58": None, "message": "Authenticated Harnyx miner configuration is unavailable."},
+            {"status": "unknown", "required": [], "configured": [], "missing": [], "requirements_complete": False},
+        )
 
     uid = _int_or_none(config.get("uid"))
     hotkey = _text(config.get("miner_hotkey_ss58")) or None
     authenticated = uid is not None and hotkey is not None
-
-    registration = {
-        "status": "registered" if authenticated else "unknown",
-        "netuid": netuid,
-        "uid": uid,
-        "hotkey_ss58": hotkey,
-        "network": None,
-        "source": "harnyx_miner_config",
-    }
-    auth = {
-        "status": "authenticated" if authenticated else "unknown",
-        "uid": uid,
-        "hotkey_ss58": hotkey,
-        "message": None if authenticated else "Harnyx did not return a recognized UID/hotkey.",
-    }
-
-    configured: list[str] = []
-    raw_credentials = _mapping(config.get("provider_credentials"))
-    for provider, raw in raw_credentials.items():
-        item = _mapping(raw)
-        if item.get("exists") is True:
-            configured.append(str(provider))
-
-    providers = {
-        "status": "unknown",
-        "required": [],
-        "configured": sorted(configured),
-        "missing": [],
-        "requirements_complete": False,
-    }
-    return registration, auth, providers
+    configured = sorted(
+        str(provider)
+        for provider, raw in _mapping(config.get("provider_credentials")).items()
+        if _mapping(raw).get("exists") is True
+    )
+    return (
+        {"status": "registered" if authenticated else "unknown", "netuid": netuid, "uid": uid, "hotkey_ss58": hotkey, "network": None, "source": "harnyx_miner_config"},
+        {"status": "authenticated" if authenticated else "unknown", "uid": uid, "hotkey_ss58": hotkey, "message": None if authenticated else "Harnyx did not return a recognized UID/hotkey."},
+        {"status": "unknown", "required": [], "configured": configured, "missing": [], "requirements_complete": False},
+    )
 
 
-def _complete_provider_state(
-    providers: Mapping[str, Any],
-    requirement: Mapping[str, Any],
-) -> dict[str, Any]:
-    configured = sorted(str(item) for item in _sequence(providers.get("configured")))
+def _complete_provider_state(current: Mapping[str, Any], requirement: Mapping[str, Any]) -> dict[str, Any]:
+    configured = sorted(str(item) for item in _sequence(current.get("configured")))
     required = sorted(str(item) for item in _sequence(requirement.get("providers")))
     complete = requirement.get("complete") is True
     missing = sorted(set(required) - set(configured))
-
-    if missing:
-        status = "not_ready"
-    elif required and complete:
-        status = "ready"
-    elif required:
-        status = "partial"
-    else:
-        status = "unknown"
-
-    return {
-        "status": status,
-        "required": required,
-        "configured": configured,
-        "missing": missing,
-        "requirements_complete": complete,
-    }
+    status = "not_ready" if missing else "ready" if required and complete else "partial" if required else "unknown"
+    return {"status": status, "required": required, "configured": configured, "missing": missing, "requirements_complete": complete}
 
 
 def _artifact_required_providers(path: Path | None) -> dict[str, Any]:
     if path is None:
         return {"providers": [], "complete": False}
     try:
-        source = path.read_text(encoding="utf-8")
-        tree = ast.parse(source, filename=str(path))
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     except (OSError, UnicodeDecodeError, SyntaxError):
         return {"providers": [], "complete": False}
 
@@ -491,21 +429,17 @@ def _artifact_required_providers(path: Path | None) -> dict[str, Any]:
     providers: set[str] = set()
     complete = True
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
+        if not isinstance(node, ast.Call) or _call_name(node.func) not in _PROVIDER_CALLS:
             continue
-        function = _call_name(node.func)
-        if function not in _PROVIDER_CALLS:
-            continue
-        provider_keyword = next((item for item in node.keywords if item.arg == "provider"), None)
-        if provider_keyword is None:
+        keyword = next((item for item in node.keywords if item.arg == "provider"), None)
+        if keyword is None:
             complete = False
             continue
-        provider = _literal_string(provider_keyword.value, constants)
+        provider = _literal_string(keyword.value, constants)
         if provider:
             providers.add(provider)
         else:
             complete = False
-
     return {"providers": sorted(providers), "complete": complete and bool(providers)}
 
 
@@ -551,36 +485,12 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _artifact_state(
-    *,
-    target: Mapping[str, Any],
-    candidate: Mapping[str, Any] | None,
-    batch: Mapping[str, Any],
-    matched_artifact: Mapping[str, Any],
-    local_artifact: Path | None,
-    recorded_uploads: Sequence[Mapping[str, Any]],
-    candidate_status: str,
-) -> dict[str, Any]:
+def _artifact_state(*, target: Mapping[str, Any], candidate: Mapping[str, Any] | None, batch: Mapping[str, Any], matched_artifact: Mapping[str, Any], local_artifact: Path | None, recorded_uploads: Sequence[Mapping[str, Any]], candidate_status: str) -> dict[str, Any]:
     upload = _latest_upload(recorded_uploads)
     source = candidate or matched_artifact or target or upload
-
-    artifact_id = (
-        _text(source.get("artifact_id"))
-        or _text(source.get("platform_artifact_id"))
-        or _text(target.get("artifact_id"))
-        or None
-    )
-    content_hash = (
-        _text(source.get("content_hash"))
-        or _text(source.get("platform_content_hash"))
-        or _text(target.get("content_hash"))
-        or None
-    )
-    submitted_at = (
-        _text(source.get("submitted_at"))
-        or _text(upload.get("submitted_at"))
-        or None
-    )
+    artifact_id = _text(source.get("artifact_id")) or _text(source.get("platform_artifact_id")) or _text(target.get("artifact_id")) or None
+    content_hash = _text(source.get("content_hash")) or _text(source.get("platform_content_hash")) or _text(target.get("content_hash")) or None
+    submitted_at = _text(source.get("submitted_at")) or _text(upload.get("submitted_at")) or None
     uid = _int_or_none(source.get("uid"))
     if uid is None:
         uid = _int_or_none(target.get("uid"))
@@ -590,28 +500,11 @@ def _artifact_state(
             size_bytes = local_artifact.stat().st_size
         except OSError:
             pass
-
     accepted = bool(artifact_id or candidate or batch or upload)
-    return {
-        "status": "accepted" if accepted else "unknown",
-        "acceptance": "accepted" if accepted else "unverified",
-        "artifact_id": artifact_id,
-        "content_hash": content_hash,
-        "submitted_at": submitted_at,
-        "uid": uid,
-        "filename": local_artifact.name if local_artifact is not None else None,
-        "size_bytes": size_bytes,
-        "candidate_status": candidate_status,
-    }
+    return {"status": "accepted" if accepted else "unknown", "acceptance": "accepted" if accepted else "unverified", "artifact_id": artifact_id, "content_hash": content_hash, "submitted_at": submitted_at, "uid": uid, "filename": local_artifact.name if local_artifact is not None else None, "size_bytes": size_bytes, "candidate_status": candidate_status}
 
 
-def _candidate_for_miner(
-    rows: Sequence[Mapping[str, Any]],
-    *,
-    hotkey_ss58: str,
-    uid: int | None,
-    uploads: Sequence[Mapping[str, Any]],
-) -> Mapping[str, Any] | None:
+def _candidate_for_miner(rows: Sequence[Mapping[str, Any]], *, hotkey_ss58: str, uid: int | None, uploads: Sequence[Mapping[str, Any]]) -> Mapping[str, Any] | None:
     if hotkey_ss58:
         for row in rows:
             if _text(row.get("miner_hotkey_ss58")) == hotkey_ss58:
@@ -620,104 +513,44 @@ def _candidate_for_miner(
         for row in rows:
             if _int_or_none(row.get("uid")) == uid:
                 return row
-
-    artifact_ids = {
-        _text(item.get("platform_artifact_id"))
-        for item in uploads
-        if _text(item.get("platform_artifact_id"))
-    }
-    hashes = {
-        _text(item.get("platform_content_hash")).lower()
-        for item in uploads
-        if _text(item.get("platform_content_hash"))
-    }
+    artifact_ids = {_text(item.get("platform_artifact_id")) for item in uploads if _text(item.get("platform_artifact_id"))}
+    hashes = {_text(item.get("platform_content_hash")).lower() for item in uploads if _text(item.get("platform_content_hash"))}
     for row in rows:
-        if _text(row.get("artifact_id")) in artifact_ids:
-            return row
-        if _text(row.get("content_hash")).lower() in hashes:
+        if _text(row.get("artifact_id")) in artifact_ids or _text(row.get("content_hash")).lower() in hashes:
             return row
     return None
 
 
-def _target_identity(
-    candidate: Mapping[str, Any] | None,
-    uploads: Sequence[Mapping[str, Any]],
-    auth: Mapping[str, Any],
-) -> dict[str, Any]:
+def _target_identity(candidate: Mapping[str, Any] | None, uploads: Sequence[Mapping[str, Any]], auth: Mapping[str, Any]) -> dict[str, Any]:
     upload = _latest_upload(uploads)
     source = candidate or upload
-    return {
-        "artifact_id": _text(source.get("artifact_id")) or _text(source.get("platform_artifact_id")),
-        "content_hash": _text(source.get("content_hash")) or _text(source.get("platform_content_hash")),
-        "uid": _int_or_none(source.get("uid")) if _int_or_none(source.get("uid")) is not None else _int_or_none(auth.get("uid")),
-        "miner_hotkey_ss58": _text(source.get("miner_hotkey_ss58")) or _text(auth.get("hotkey_ss58")),
-        "submitted_at": _text(source.get("submitted_at")),
-        "size_bytes": _int_or_none(source.get("size_bytes")),
-    }
+    uid = _int_or_none(source.get("uid"))
+    return {"artifact_id": _text(source.get("artifact_id")) or _text(source.get("platform_artifact_id")), "content_hash": _text(source.get("content_hash")) or _text(source.get("platform_content_hash")), "uid": uid if uid is not None else _int_or_none(auth.get("uid")), "miner_hotkey_ss58": _text(source.get("miner_hotkey_ss58")) or _text(auth.get("hotkey_ss58")), "submitted_at": _text(source.get("submitted_at")), "size_bytes": _int_or_none(source.get("size_bytes"))}
 
 
 def _latest_upload(uploads: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
-    if not uploads:
-        return {}
-    return max(uploads, key=lambda item: _text(item.get("submitted_at")))
+    return max(uploads, key=lambda item: _text(item.get("submitted_at"))) if uploads else {}
 
 
 def _scheduler_state(payload: Mapping[str, Any]) -> dict[str, Any]:
     runtime = _mapping(payload.get("runtime"))
     health = _mapping(payload.get("validator_health"))
     next_batch = runtime.get("next_scheduled_batch_at")
-    if "next_scheduled_batch_at" not in runtime:
-        status = "unknown"
-    elif next_batch in (None, ""):
-        status = "disabled"
-    else:
-        status = "scheduled"
-    return {
-        "status": status,
-        "next_scheduled_batch_at": _text(next_batch) or None,
-        "cron": _text(runtime.get("miner_task_schedule_cron")) or None,
-        "evaluation_timeout_seconds": _number_or_none(runtime.get("miner_evaluation_timeout_seconds")),
-        "validator_health": {
-            "healthy": _int_or_none(health.get("healthy")),
-            "unhealthy": _int_or_none(health.get("unhealthy")),
-            "unknown": _int_or_none(health.get("unknown")),
-        },
-    }
+    status = "unknown" if "next_scheduled_batch_at" not in runtime else "disabled" if next_batch in (None, "") else "scheduled"
+    return {"status": status, "next_scheduled_batch_at": _text(next_batch) or None, "cron": _text(runtime.get("miner_task_schedule_cron")) or None, "evaluation_timeout_seconds": _number_or_none(runtime.get("miner_evaluation_timeout_seconds")), "validator_health": {"healthy": _int_or_none(health.get("healthy")), "unhealthy": _int_or_none(health.get("unhealthy")), "unknown": _int_or_none(health.get("unknown"))}}
 
 
-def _validator_execution_state(
-    batch: Mapping[str, Any],
-    artifact: Mapping[str, Any],
-) -> dict[str, Any]:
+def _validator_execution_state(batch: Mapping[str, Any], artifact: Mapping[str, Any]) -> dict[str, Any]:
     if not batch:
-        return {
-            "status": "not_started",
-            "validator_count": None,
-            "resolved_count": None,
-            "total_count": None,
-            "percent_complete": None,
-            "started_at": None,
-            "stage": None,
-        }
-
+        return {"status": "not_started", "validator_count": None, "resolved_count": None, "total_count": None, "percent_complete": None, "started_at": None, "stage": None}
     progress = _mapping(batch.get("stage_progress"))
-    validators = _sequence(progress.get("validators"))
+    validators = [item for item in _sequence(progress.get("validators")) if isinstance(item, Mapping)]
     stage = _text(progress.get("stage"))
-    artifact_status = (
-        _text(artifact.get("delivery_status"))
-        or _text(artifact.get("execution_status"))
-        or _text(artifact.get("status"))
-    ).lower()
-
-    confirmed_running = artifact_status in {
-        "running",
-        "executing",
-        "in_progress",
-        "delivered",
-        "completed",
-    }
-    if confirmed_running:
-        status = "running" if artifact_status not in {"completed"} else "completed"
+    artifact_status = (_text(artifact.get("delivery_status")) or _text(artifact.get("execution_status")) or _text(artifact.get("status"))).lower()
+    if artifact_status in {"running", "executing", "in_progress", "delivered"}:
+        status = "running"
+    elif artifact_status == "completed":
+        status = "completed"
     elif _text(batch.get("status")).lower() == "running" and stage == "running_and_scoring_tasks":
         status = "batch_running_unconfirmed"
     elif _text(batch.get("status")).lower() == "initializing":
@@ -726,606 +559,197 @@ def _validator_execution_state(
         status = "complete_or_unavailable"
     else:
         status = "unknown"
-
-    resolved = sum(_int_or_none(item.get("resolved_count")) or 0 for item in validators if isinstance(item, Mapping))
-    total = sum(_int_or_none(item.get("total_count")) or 0 for item in validators if isinstance(item, Mapping))
-    percent = (resolved / total * 100.0) if total else None
-
-    return {
-        "status": status,
-        "validator_count": len(validators) if validators else None,
-        "resolved_count": resolved if validators else None,
-        "total_count": total if validators else None,
-        "percent_complete": percent,
-        "started_at": _text(progress.get("started_at")) or None,
-        "stage": stage or None,
-    }
+    resolved = sum(_int_or_none(item.get("resolved_count")) or 0 for item in validators)
+    total = sum(_int_or_none(item.get("total_count")) or 0 for item in validators)
+    return {"status": status, "validator_count": len(validators) if validators else None, "resolved_count": resolved if validators else None, "total_count": total if validators else None, "percent_complete": (resolved / total * 100.0) if total else None, "started_at": _text(progress.get("started_at")) or None, "stage": stage or None}
 
 
-def _evaluation_state(
-    batch: Mapping[str, Any],
-    artifact: Mapping[str, Any],
-    comparison: Mapping[str, Any],
-) -> dict[str, Any]:
+def _evaluation_state(batch: Mapping[str, Any], artifact: Mapping[str, Any], comparison: Mapping[str, Any]) -> dict[str, Any]:
     batch_status = _text(batch.get("status")).lower()
     stage = _text(batch.get("evaluation_stage")).lower()
-    explicit_main = _bool_first(
-        artifact.get("main_admitted"),
-        artifact.get("admitted_to_main"),
-        comparison.get("main_admitted"),
-        comparison.get("admitted_to_main"),
-    )
-
-    if stage == "qualifying" and batch_status in {"initializing", "running"}:
-        qualifying = "running" if batch_status == "running" else "pending"
-    elif explicit_main is True or stage == "main":
-        qualifying = "complete"
-    elif batch_status == "completed" and stage == "qualifying":
-        qualifying = "complete"
-    else:
-        qualifying = "unknown"
-
-    if explicit_main is True:
-        main = "running" if batch_status == "running" else ("complete" if batch_status == "completed" else "admitted")
-    elif explicit_main is False:
-        main = "not_admitted"
-    elif stage == "main" and batch_status in {"running", "completed"}:
-        main = "unknown"
-    else:
-        main = "not_started"
-
-    total_score = _number_first(
-        comparison.get("total_score"),
-        artifact.get("total_score"),
-        comparison.get("score"),
-    )
-    comparison_score = _number_first(
-        comparison.get("comparison_score"),
-        artifact.get("comparison_score"),
-    )
-    qualifying_score = _number_first(
-        comparison.get("qualifying_score"),
-        artifact.get("qualifying_score"),
-    )
-    median_cost = _number_first(
-        comparison.get("median_cost_usd"),
-        artifact.get("median_cost_usd"),
-        comparison.get("cost_usd"),
-    )
-    total_cost = _number_first(
-        comparison.get("total_cost_usd"),
-        artifact.get("total_cost_usd"),
-    )
-    median_runtime = _number_first(
-        comparison.get("median_elapsed_ms"),
-        comparison.get("median_runtime_ms"),
-        artifact.get("median_elapsed_ms"),
-        artifact.get("median_runtime_ms"),
-    )
-    novelty = (
-        _text(comparison.get("novelty_classification"))
-        or _text(comparison.get("novelty"))
-        or _text(artifact.get("novelty_classification"))
-        or None
-    )
+    explicit_main = _bool_first(artifact.get("main_admitted"), artifact.get("admitted_to_main"), comparison.get("main_admitted"), comparison.get("admitted_to_main"))
+    qualifying = "running" if stage == "qualifying" and batch_status == "running" else "pending" if stage == "qualifying" and batch_status == "initializing" else "complete" if explicit_main is True or stage == "main" or (batch_status == "completed" and stage == "qualifying") else "unknown"
+    main = "running" if explicit_main is True and batch_status == "running" else "complete" if explicit_main is True and batch_status == "completed" else "admitted" if explicit_main is True else "not_admitted" if explicit_main is False else "unknown" if stage == "main" and batch_status in {"running", "completed"} else "not_started"
+    total_score = _number_first(comparison.get("total_score"), artifact.get("total_score"), comparison.get("score"))
     error_counts = comparison.get("error_counts")
     if not isinstance(error_counts, Mapping):
         error_counts = artifact.get("error_counts")
-    if not isinstance(error_counts, Mapping):
-        error_counts = None
-
-    final_status = "scored" if batch_status == "completed" and total_score is not None else (
-        "complete_score_unavailable" if batch_status == "completed" else "pending"
-    )
-
-    return {
-        "qualifying_status": qualifying,
-        "main_status": main,
-        "main_admitted": explicit_main,
-        "final_status": final_status,
-        "qualifying_score": qualifying_score,
-        "total_score": total_score,
-        "comparison_score": comparison_score,
-        "median_cost_usd": median_cost,
-        "total_cost_usd": total_cost,
-        "median_runtime_ms": median_runtime,
-        "novelty_classification": novelty,
-        "error_counts": dict(error_counts) if isinstance(error_counts, Mapping) else None,
-        "source": "harnyx_official_results" if comparison else "harnyx_batch_monitoring",
-    }
+    return {"qualifying_status": qualifying, "main_status": main, "main_admitted": explicit_main, "final_status": "scored" if batch_status == "completed" and total_score is not None else "complete_score_unavailable" if batch_status == "completed" else "pending", "qualifying_score": _number_first(comparison.get("qualifying_score"), artifact.get("qualifying_score")), "total_score": total_score, "comparison_score": _number_first(comparison.get("comparison_score"), artifact.get("comparison_score")), "median_cost_usd": _number_first(comparison.get("median_cost_usd"), artifact.get("median_cost_usd"), comparison.get("cost_usd")), "total_cost_usd": _number_first(comparison.get("total_cost_usd"), artifact.get("total_cost_usd")), "median_runtime_ms": _number_first(comparison.get("median_elapsed_ms"), comparison.get("median_runtime_ms"), artifact.get("median_elapsed_ms"), artifact.get("median_runtime_ms")), "novelty_classification": _text(comparison.get("novelty_classification")) or _text(comparison.get("novelty")) or _text(artifact.get("novelty_classification")) or None, "error_counts": dict(error_counts) if isinstance(error_counts, Mapping) else None, "source": "harnyx_official_results" if comparison else "harnyx_batch_monitoring"}
 
 
 def _allocation_state(comparison: Mapping[str, Any]) -> dict[str, Any]:
-    reward_eligible = _bool_first(
-        comparison.get("reward_eligible"),
-        comparison.get("participant_reward_eligible"),
-    )
-    weight = _number_first(
-        comparison.get("weight"),
-        comparison.get("allocation"),
-        comparison.get("participant_weight"),
-        comparison.get("reward_weight"),
-    )
-    if weight is not None:
-        status = "calculated"
-    elif reward_eligible is False:
-        status = "no_participant_allocation"
-    elif reward_eligible is True:
-        status = "eligible_pending_weight"
-    else:
-        status = "unknown"
-    return {
-        "status": status,
-        "reward_eligible": reward_eligible,
-        "weight": weight,
-        "source_batch_id": _text(comparison.get("batch_id")) or None,
-        "source": "harnyx_artifact_comparison" if comparison else None,
-    }
+    reward_eligible = _bool_first(comparison.get("reward_eligible"), comparison.get("participant_reward_eligible"))
+    weight = _number_first(comparison.get("weight"), comparison.get("allocation"), comparison.get("participant_weight"), comparison.get("reward_weight"))
+    status = "calculated" if weight is not None else "no_participant_allocation" if reward_eligible is False else "eligible_pending_weight" if reward_eligible is True else "unknown"
+    return {"status": status, "reward_eligible": reward_eligible, "weight": weight, "source_batch_id": _text(comparison.get("batch_id")) or None, "source": "harnyx_artifact_comparison" if comparison else None}
 
 
 def _onchain_state(*, netuid: int | None) -> dict[str, Any]:
-    return {
-        "status": "unavailable",
-        "netuid": netuid,
-        "weight_submitted": None,
-        "incentive": None,
-        "emission_tao": None,
-        "rank": None,
-        "trust": None,
-        "consensus": None,
-        "stake": None,
-        "last_update": None,
-        "source": "bittensor",
-        "message": (
-            "This repository has no authoritative read-only metagraph/weight-submission integration yet. "
-            "Wallet balance and cumulative earnings are not treated as proof of current SN67 emission."
-        ),
-    }
+    return {"status": "unavailable", "netuid": netuid, "weight_submitted": None, "incentive": None, "emission_tao": None, "rank": None, "trust": None, "consensus": None, "stake": None, "last_update": None, "source": "bittensor", "message": "This repository has no authoritative read-only metagraph/weight-submission integration yet. Wallet balance and cumulative earnings are not treated as proof of current SN67 emission."}
 
 
-def _phase(
-    *,
-    registration: Mapping[str, Any],
-    harnyx_auth: Mapping[str, Any],
-    providers: Mapping[str, Any],
-    artifact: Mapping[str, Any],
-    batch: Mapping[str, Any],
-    validator_execution: Mapping[str, Any],
-    evaluation: Mapping[str, Any],
-    allocation: Mapping[str, Any],
-    onchain: Mapping[str, Any],
-) -> str:
-    if onchain.get("status") == "emitting":
-        return "emitting"
-    if onchain.get("weight_submitted") is True:
-        return "onchain"
-    if allocation.get("status") == "calculated":
-        return "weight_calculated"
-    if evaluation.get("final_status") in {"scored", "complete_score_unavailable"}:
-        return "scored"
-    if evaluation.get("main_status") in {"running", "admitted"}:
-        return "main"
-    if _text(batch.get("evaluation_stage")).lower() == "qualifying" and _text(batch.get("status")).lower() == "running":
-        return "qualifying"
-    if validator_execution.get("status") == "running":
-        return "validator_running"
-    if batch:
-        return "batch_selected"
-    if artifact.get("candidate_status") == "current_candidate":
-        return "candidate"
-    if artifact.get("acceptance") == "accepted":
-        return "submitted"
-    if providers.get("status") == "not_ready":
-        return "provider_not_ready"
-    if harnyx_auth.get("status") == "authenticated":
-        return "authenticated"
-    if registration.get("status") == "registered":
-        return "registered"
+def _phase(*, registration: Mapping[str, Any], harnyx_auth: Mapping[str, Any], providers: Mapping[str, Any], artifact: Mapping[str, Any], batch: Mapping[str, Any], validator_execution: Mapping[str, Any], evaluation: Mapping[str, Any], allocation: Mapping[str, Any], onchain: Mapping[str, Any]) -> str:
+    if onchain.get("status") == "emitting": return "emitting"
+    if onchain.get("weight_submitted") is True: return "onchain"
+    if allocation.get("status") == "calculated": return "weight_calculated"
+    if evaluation.get("final_status") in {"scored", "complete_score_unavailable"}: return "scored"
+    if evaluation.get("main_status") in {"running", "admitted"}: return "main"
+    if _text(batch.get("evaluation_stage")).lower() == "qualifying" and _text(batch.get("status")).lower() == "running": return "qualifying"
+    if validator_execution.get("status") == "running": return "validator_running"
+    if batch: return "batch_selected"
+    if artifact.get("candidate_status") == "current_candidate": return "candidate"
+    if artifact.get("acceptance") == "accepted": return "submitted"
+    if providers.get("status") == "not_ready": return "provider_not_ready"
+    if harnyx_auth.get("status") == "authenticated": return "authenticated"
+    if registration.get("status") == "registered": return "registered"
     return "unknown"
 
 
-def _summary_for_phase(
-    phase: str,
-    batch: Mapping[str, Any],
-    artifact: Mapping[str, Any],
-) -> dict[str, Any]:
-    labels = {
-        "registered": ("REGISTERED", "SN67 registration is recognized."),
-        "authenticated": ("HARNYX CONNECTED", "Harnyx recognizes the signing hotkey."),
-        "provider_not_ready": ("PROVIDER ACTION REQUIRED", "At least one known required provider is not configured."),
-        "submitted": ("SUBMITTED", "Artifact upload is accepted; candidate state is not confirmed."),
-        "candidate": ("READY — AWAITING BATCH SELECTION", "The artifact is Harnyx's current candidate for this miner."),
-        "batch_selected": ("BATCH SELECTED", "The artifact is present in finalized batch membership."),
-        "validator_running": ("ACTIVE — VALIDATORS EXECUTING", "Artifact-level validator execution is confirmed."),
-        "qualifying": ("ACTIVE — QUALIFYING", "The selected artifact is in the qualifying evaluation stage."),
-        "main": ("ACTIVE — MAIN EVALUATION", "The artifact is in the main evaluation stage."),
-        "scored": ("EVALUATION COMPLETE", "Harnyx finalized this batch; official result fields are shown when exposed."),
-        "weight_calculated": ("ALLOCATION CALCULATED", "Harnyx exposed an allocation/weight value for the artifact."),
-        "onchain": ("WEIGHT SUBMITTED ON-CHAIN", "Bittensor weight submission is independently confirmed."),
-        "emitting": ("EMISSION ACTIVE", "Current on-chain emission is independently confirmed."),
-        "unknown": ("STATUS UNKNOWN", "Reliable production lifecycle data is currently unavailable."),
-    }
+def _summary_for_phase(phase: str, batch: Mapping[str, Any], artifact: Mapping[str, Any]) -> dict[str, Any]:
+    labels = {"registered": ("REGISTERED", "SN67 registration is recognized."), "authenticated": ("HARNYX CONNECTED", "Harnyx recognizes the signing hotkey."), "provider_not_ready": ("PROVIDER ACTION REQUIRED", "At least one known required provider is not configured."), "submitted": ("SUBMITTED", "Artifact upload is accepted; candidate state is not confirmed."), "candidate": ("READY — AWAITING BATCH SELECTION", "The artifact is Harnyx's current candidate for this miner."), "batch_selected": ("BATCH SELECTED", "The artifact is present in finalized batch membership."), "validator_running": ("ACTIVE — VALIDATORS EXECUTING", "Artifact-level validator execution is confirmed."), "qualifying": ("ACTIVE — QUALIFYING", "The selected artifact is in the qualifying evaluation stage."), "main": ("ACTIVE — MAIN EVALUATION", "The artifact is in the main evaluation stage."), "scored": ("EVALUATION COMPLETE", "Harnyx finalized this batch; official result fields are shown when exposed."), "weight_calculated": ("ALLOCATION CALCULATED", "Harnyx exposed an allocation/weight value for the artifact."), "onchain": ("WEIGHT SUBMITTED ON-CHAIN", "Bittensor weight submission is independently confirmed."), "emitting": ("EMISSION ACTIVE", "Current on-chain emission is independently confirmed."), "unknown": ("STATUS UNKNOWN", "Reliable production lifecycle data is currently unavailable.")}
     title, detail = labels.get(phase, (phase.replace("_", " ").upper(), ""))
-    next_step = {
-        "candidate": "Batch selection",
-        "batch_selected": "Validator execution",
-        "qualifying": "Qualifying completion / main admission",
-        "main": "Final scoring",
-        "scored": "Allocation / weight calculation",
-        "weight_calculated": "Bittensor on-chain confirmation",
-    }.get(phase)
-    return {
-        "title": title,
-        "detail": detail,
-        "next_step": next_step,
-        "batch_id": _text(batch.get("batch_id")) or None,
-        "artifact_id": _text(artifact.get("artifact_id")) or None,
-    }
+    next_step = {"candidate": "Batch selection", "batch_selected": "Validator execution", "qualifying": "Qualifying completion / main admission", "main": "Final scoring", "scored": "Allocation / weight calculation", "weight_calculated": "Bittensor on-chain confirmation"}.get(phase)
+    return {"title": title, "detail": detail, "next_step": next_step, "batch_id": _text(batch.get("batch_id")) or None, "artifact_id": _text(artifact.get("artifact_id")) or None}
 
 
 def _read_miner_config() -> Mapping[str, Any] | None:
     submission = get_config_section("submission")
-    base_env = str(submission.get("platform_base_url_env") or "PLATFORM_BASE_URL")
-    wallet_env = str(submission.get("wallet_name_env") or "HARNYX_WALLET_NAME")
-    hotkey_env = str(submission.get("hotkey_name_env") or "HARNYX_HOTKEY_NAME")
-
-    base_url = os.getenv(base_env, "").strip()
-    wallet_name = os.getenv(wallet_env, "").strip()
-    hotkey_name = os.getenv(hotkey_env, "").strip()
-    if not base_url or not wallet_name or not hotkey_name:
-        return None
-
+    base_url = os.getenv(str(submission.get("platform_base_url_env") or "PLATFORM_BASE_URL"), "").strip()
+    wallet_name = os.getenv(str(submission.get("wallet_name_env") or "HARNYX_WALLET_NAME"), "").strip()
+    hotkey_name = os.getenv(str(submission.get("hotkey_name_env") or "HARNYX_HOTKEY_NAME"), "").strip()
+    if not base_url or not wallet_name or not hotkey_name: return None
     harnyx = require_external_repository("harnyx", "miner/src/harnyx_miner/miner_config.py")
-    completed = run_checked(
-        [
-            "uv",
-            "run",
-            "--frozen",
-            "--package",
-            "harnyx-miner",
-            "harnyx-miner-config",
-            "--wallet-name",
-            wallet_name,
-            "--hotkey-name",
-            hotkey_name,
-            "--get",
-        ],
-        cwd=harnyx,
-        timeout=30,
-        env_overrides={"PLATFORM_BASE_URL": base_url},
-    )
+    completed = run_checked(["uv", "run", "--frozen", "--package", "harnyx-miner", "harnyx-miner-config", "--wallet-name", wallet_name, "--hotkey-name", hotkey_name, "--get"], cwd=harnyx, timeout=30, env_overrides={"PLATFORM_BASE_URL": base_url})
     raw = _json_result(completed.stdout)
-    return {
-        "miner_hotkey_ss58": raw.get("miner_hotkey_ss58"),
-        "uid": raw.get("uid"),
-        "task_retry_count": raw.get("task_retry_count"),
-        "provider_credentials": _sanitized_provider_credentials(raw.get("provider_credentials")),
-    }
+    return {"miner_hotkey_ss58": raw.get("miner_hotkey_ss58"), "uid": raw.get("uid"), "task_retry_count": raw.get("task_retry_count"), "provider_credentials": _sanitized_provider_credentials(raw.get("provider_credentials"))}
 
 
 def _sanitized_provider_credentials(value: object) -> dict[str, Any]:
-    raw = _mapping(value)
-    output: dict[str, Any] = {}
-    for provider, item in raw.items():
-        data = _mapping(item)
-        output[str(provider)] = {
-            "provider": str(provider),
-            "exists": data.get("exists") is True,
-            "created_at": data.get("created_at"),
-            "updated_at": data.get("updated_at"),
-        }
-    return output
+    return {str(provider): {"provider": str(provider), "exists": _mapping(raw).get("exists") is True, "created_at": _mapping(raw).get("created_at"), "updated_at": _mapping(raw).get("updated_at")} for provider, raw in _mapping(value).items()}
 
 
 def _json_result(stdout: str) -> dict[str, Any]:
     for line in reversed(stdout.splitlines()):
         line = line.strip()
-        if not line:
-            continue
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict):
-            return value
+        if not line: continue
+        try: value = json.loads(line)
+        except json.JSONDecodeError: continue
+        if isinstance(value, dict): return value
     raise RuntimeError("Harnyx command returned no machine-readable JSON object.")
 
 
 def _public_mcp_snapshot(base_url: str) -> dict[str, Mapping[str, Any]]:
+    return _mcp_tools(base_url, {"get_latest_submissions": {}, "get_validators": {}})
+
+
+def _mcp_artifact_comparison(base_url: str, *, batch_id: str, artifact_id: str) -> Mapping[str, Any]:
+    return _mcp_tools(base_url, {"get_miner_task_batch_artifact_comparison": {"batch_id": batch_id, "artifact_id": artifact_id}}).get("get_miner_task_batch_artifact_comparison", {})
+
+
+def _mcp_tools(base_url: str, calls: Mapping[str, Mapping[str, Any]]) -> dict[str, Mapping[str, Any]]:
     endpoint = f"{base_url.rstrip('/')}/mcp"
-    tools = ("get_latest_submissions", "get_validators")
     output: dict[str, Mapping[str, Any]] = {}
     with httpx.Client(timeout=_mcp_timeout_seconds(), follow_redirects=True) as client:
-        session_id, protocol_version = _mcp_initialize(client, endpoint)
-        headers = _mcp_headers(session_id=session_id, protocol_version=protocol_version)
-        notification = {
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized",
-        }
-        response = client.post(endpoint, headers=headers, json=notification)
-        if response.status_code not in {200, 202, 204}:
-            response.raise_for_status()
-
-        request_id = 10
-        for name in tools:
-            request_id += 1
-            result = _mcp_request(
-                client,
-                endpoint,
-                headers=headers,
-                payload={
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "method": "tools/call",
-                    "params": {"name": name, "arguments": {}},
-                },
-            )
-            output[name] = _mcp_tool_payload(result)
-
+        init, response = _mcp_request_with_response(client, endpoint, headers={"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}, payload={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": _MCP_PROTOCOL_VERSION, "capabilities": {}, "clientInfo": _MCP_CLIENT_INFO}})
+        protocol = _text(_mapping(init.get("result")).get("protocolVersion")) or _MCP_PROTOCOL_VERSION
+        headers = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json", "MCP-Protocol-Version": protocol}
+        session_id = response.headers.get("mcp-session-id")
+        if session_id: headers["Mcp-Session-Id"] = session_id
+        initialized = client.post(endpoint, headers=headers, json={"jsonrpc": "2.0", "method": "notifications/initialized"})
+        if initialized.status_code not in {200, 202, 204}: initialized.raise_for_status()
+        for request_id, (name, arguments) in enumerate(calls.items(), start=10):
+            message, _ = _mcp_request_with_response(client, endpoint, headers=headers, payload={"jsonrpc": "2.0", "id": request_id, "method": "tools/call", "params": {"name": name, "arguments": dict(arguments)}})
+            error = message.get("error")
+            if isinstance(error, Mapping): raise RuntimeError(str(error.get("message") or "MCP request failed."))
+            output[name] = _mcp_tool_payload(_mapping(message.get("result")))
         if session_id:
-            try:
-                client.delete(endpoint, headers=headers)
-            except httpx.HTTPError:
-                pass
+            try: client.delete(endpoint, headers=headers)
+            except httpx.HTTPError: pass
     return output
 
 
-def _mcp_artifact_comparison(
-    base_url: str,
-    *,
-    batch_id: str,
-    artifact_id: str,
-) -> Mapping[str, Any] | None:
-    endpoint = f"{base_url.rstrip('/')}/mcp"
-    with httpx.Client(timeout=_mcp_timeout_seconds(), follow_redirects=True) as client:
-        session_id, protocol_version = _mcp_initialize(client, endpoint)
-        headers = _mcp_headers(session_id=session_id, protocol_version=protocol_version)
-        response = client.post(
-            endpoint,
-            headers=headers,
-            json={"jsonrpc": "2.0", "method": "notifications/initialized"},
-        )
-        if response.status_code not in {200, 202, 204}:
-            response.raise_for_status()
-        result = _mcp_request(
-            client,
-            endpoint,
-            headers=headers,
-            payload={
-                "jsonrpc": "2.0",
-                "id": 21,
-                "method": "tools/call",
-                "params": {
-                    "name": "get_miner_task_batch_artifact_comparison",
-                    "arguments": {"batch_id": batch_id, "artifact_id": artifact_id},
-                },
-            },
-        )
-        return _mcp_tool_payload(result)
-
-
-def _mcp_initialize(client: httpx.Client, endpoint: str) -> tuple[str | None, str]:
-    result, response = _mcp_request_with_response(
-        client,
-        endpoint,
-        headers={
-            "Accept": "application/json, text/event-stream",
-            "Content-Type": "application/json",
-        },
-        payload={
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": _MCP_PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": _MCP_CLIENT_INFO,
-            },
-        },
-    )
-    negotiated = _text(_mapping(result.get("result")).get("protocolVersion")) or _MCP_PROTOCOL_VERSION
-    session_id = response.headers.get("mcp-session-id")
-    return session_id, negotiated
-
-
-def _mcp_headers(*, session_id: str | None, protocol_version: str) -> dict[str, str]:
-    headers = {
-        "Accept": "application/json, text/event-stream",
-        "Content-Type": "application/json",
-        "MCP-Protocol-Version": protocol_version,
-    }
-    if session_id:
-        headers["Mcp-Session-Id"] = session_id
-    return headers
-
-
-def _mcp_request(
-    client: httpx.Client,
-    endpoint: str,
-    *,
-    headers: Mapping[str, str],
-    payload: Mapping[str, Any],
-) -> Mapping[str, Any]:
-    message, _ = _mcp_request_with_response(client, endpoint, headers=headers, payload=payload)
-    error = message.get("error")
-    if isinstance(error, Mapping):
-        raise RuntimeError(str(error.get("message") or "MCP request failed."))
-    result = message.get("result")
-    if not isinstance(result, Mapping):
-        raise ValueError("MCP response did not contain an object result.")
-    return result
-
-
-def _mcp_request_with_response(
-    client: httpx.Client,
-    endpoint: str,
-    *,
-    headers: Mapping[str, str],
-    payload: Mapping[str, Any],
-) -> tuple[Mapping[str, Any], httpx.Response]:
-    response = client.post(endpoint, headers=dict(headers), json=dict(payload))
-    response.raise_for_status()
-    return _mcp_message(response), response
+def _mcp_request_with_response(client: httpx.Client, endpoint: str, *, headers: Mapping[str, str], payload: Mapping[str, Any]) -> tuple[Mapping[str, Any], httpx.Response]:
+    response = client.post(endpoint, headers=dict(headers), json=dict(payload)); response.raise_for_status(); return _mcp_message(response), response
 
 
 def _mcp_message(response: httpx.Response) -> Mapping[str, Any]:
     content_type = response.headers.get("content-type", "").lower()
     if "application/json" in content_type:
         payload = response.json()
-        if not isinstance(payload, Mapping):
-            raise ValueError("MCP JSON response must be an object.")
-        return payload
-
+        if isinstance(payload, Mapping): return payload
+        raise ValueError("MCP JSON response must be an object.")
     if "text/event-stream" in content_type:
         messages: list[Mapping[str, Any]] = []
         for line in response.text.splitlines():
-            line = line.strip()
-            if not line.startswith("data:"):
-                continue
-            try:
-                value = json.loads(line[5:].strip())
-            except json.JSONDecodeError:
-                continue
-            if isinstance(value, Mapping):
-                messages.append(value)
-        if not messages:
-            raise ValueError("MCP SSE response contained no JSON-RPC message.")
-        return messages[-1]
-
+            if not line.strip().startswith("data:"): continue
+            try: value = json.loads(line.strip()[5:].strip())
+            except json.JSONDecodeError: continue
+            if isinstance(value, Mapping): messages.append(value)
+        if messages: return messages[-1]
+        raise ValueError("MCP SSE response contained no JSON-RPC message.")
     payload = response.json()
-    if not isinstance(payload, Mapping):
-        raise ValueError("MCP response must be a JSON object.")
-    return payload
+    if isinstance(payload, Mapping): return payload
+    raise ValueError("MCP response must be a JSON object.")
 
 
 def _mcp_tool_payload(result: Mapping[str, Any]) -> Mapping[str, Any]:
     structured = result.get("structuredContent")
-    if not isinstance(structured, Mapping):
-        structured = result.get("structured_content")
-    if isinstance(structured, Mapping):
-        return dict(structured)
-
-    content = _sequence(result.get("content"))
-    for item in content:
-        if not isinstance(item, Mapping) or item.get("type") != "text":
-            continue
-        text = _text(item.get("text"))
-        if not text:
-            continue
-        try:
-            payload = json.loads(text)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(payload, Mapping):
-            return dict(payload)
+    if not isinstance(structured, Mapping): structured = result.get("structured_content")
+    if isinstance(structured, Mapping): return dict(structured)
+    for item in _sequence(result.get("content")):
+        if not isinstance(item, Mapping) or item.get("type") != "text": continue
+        try: payload = json.loads(_text(item.get("text")))
+        except json.JSONDecodeError: continue
+        if isinstance(payload, Mapping): return dict(payload)
     return {}
 
 
 def _recorded_uploads() -> tuple[Mapping[str, Any], ...]:
-    uploads: list[Mapping[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
+    uploads: list[Mapping[str, Any]] = []; seen: set[tuple[str, str]] = set()
     for candidate in list_artifact_candidates():
         previous = candidate.get("previous_upload")
-        if not isinstance(previous, Mapping):
-            continue
-        artifact_id = _text(previous.get("platform_artifact_id"))
-        content_hash = _text(previous.get("platform_content_hash")).lower()
-        if not artifact_id and not content_hash:
-            continue
+        if not isinstance(previous, Mapping): continue
+        artifact_id = _text(previous.get("platform_artifact_id")); content_hash = _text(previous.get("platform_content_hash")).lower()
+        if not artifact_id and not content_hash: continue
         key = (artifact_id, content_hash)
-        if key in seen:
-            continue
-        seen.add(key)
-        uploads.append(previous)
+        if key not in seen: seen.add(key); uploads.append(previous)
     return tuple(uploads)
 
 
 def _platform_base_url() -> str | None:
-    config = get_config_section("submission")
-    env_name = str(config.get("platform_base_url_env") or "PLATFORM_BASE_URL")
-    value = os.getenv(env_name, "").strip()
-    return value.rstrip("/") if value else None
+    config = get_config_section("submission"); env_name = str(config.get("platform_base_url_env") or "PLATFORM_BASE_URL"); value = os.getenv(env_name, "").strip(); return value.rstrip("/") if value else None
 
 
-def _request_timeout_seconds() -> float:
-    config = get_config_section("submission")
-    raw = config.get("monitoring_timeout_seconds", 8.0)
-    return float(raw) if isinstance(raw, (int, float)) and not isinstance(raw, bool) else 8.0
+def _numeric_config(key: str, default: float) -> float:
+    raw = get_config_section("submission").get(key, default); return float(raw) if isinstance(raw, (int, float)) and not isinstance(raw, bool) else default
 
 
-def _mcp_timeout_seconds() -> float:
-    config = get_config_section("submission")
-    raw = config.get("monitoring_mcp_timeout_seconds", 12.0)
-    return float(raw) if isinstance(raw, (int, float)) and not isinstance(raw, bool) else 12.0
-
-
+def _request_timeout_seconds() -> float: return _numeric_config("monitoring_timeout_seconds", 8.0)
+def _mcp_timeout_seconds() -> float: return _numeric_config("monitoring_mcp_timeout_seconds", 12.0)
 def _batch_limit() -> int:
-    config = get_config_section("submission")
-    raw = config.get("monitoring_batch_limit", 25)
-    if isinstance(raw, int) and not isinstance(raw, bool) and 1 <= raw <= 100:
-        return raw
-    return 25
-
+    raw = get_config_section("submission").get("monitoring_batch_limit", 25); return raw if isinstance(raw, int) and not isinstance(raw, bool) and 1 <= raw <= 100 else 25
 
 def _completed_scan_limit() -> int:
-    config = get_config_section("submission")
-    raw = config.get("monitoring_completed_scan_limit", 4)
-    if isinstance(raw, int) and not isinstance(raw, bool) and 1 <= raw <= 20:
-        return raw
-    return 4
+    raw = get_config_section("submission").get("monitoring_completed_scan_limit", 4); return raw if isinstance(raw, int) and not isinstance(raw, bool) and 1 <= raw <= 20 else 4
 
-
-def _rows(payload: Mapping[str, Any] | None, key: str) -> tuple[Mapping[str, Any], ...]:
-    if payload is None:
-        return ()
-    return tuple(item for item in _sequence(payload.get(key)) if isinstance(item, Mapping))
-
-
-def _mapping(value: object) -> Mapping[str, Any]:
-    return value if isinstance(value, Mapping) else {}
-
-
-def _sequence(value: object) -> Sequence[Any]:
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return value
-    return ()
-
-
-def _text(value: object) -> str:
-    return value.strip() if isinstance(value, str) else ""
-
-
+def _rows(payload: Mapping[str, Any] | None, key: str) -> tuple[Mapping[str, Any], ...]: return tuple(item for item in _sequence(_mapping(payload).get(key)) if isinstance(item, Mapping))
+def _mapping(value: object) -> Mapping[str, Any]: return value if isinstance(value, Mapping) else {}
+def _sequence(value: object) -> Sequence[Any]: return value if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)) else ()
+def _text(value: object) -> str: return value.strip() if isinstance(value, str) else ""
 def _int_or_none(value: object) -> int | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float) and value.is_integer():
-        return int(value)
+    if isinstance(value, bool): return None
+    if isinstance(value, int): return value
+    if isinstance(value, float) and value.is_integer(): return int(value)
     return None
 
-
-def _number_or_none(value: object) -> float | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    return None
-
-
+def _number_or_none(value: object) -> float | None: return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 def _number_first(*values: object) -> float | None:
     for value in values:
         number = _number_or_none(value)
-        if number is not None:
-            return number
+        if number is not None: return number
     return None
 
-
-def _bool_first(*values: object) -> bool | None:
-    for value in values:
-        if isinstance(value, bool):
-            return value
-    return None
+def _bool_first(*values: object) -> bool | None: return next((value for value in values if isinstance(value, bool)), None)
 
 
 __all__ = ["mining_status_snapshot"]
