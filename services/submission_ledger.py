@@ -167,6 +167,28 @@ class SubmissionLedger:
                 ),
             )
 
+    def recent_uploads(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(int(limit), 500))
+        rows = self.connection.execute(
+            """
+            SELECT
+                artifact_hash,
+                profile,
+                status,
+                platform_artifact_id,
+                platform_content_hash,
+                uid,
+                size_bytes,
+                submitted_at
+            FROM submissions
+            ORDER BY submitted_at DESC
+            LIMIT ?
+            """,
+            (safe_limit,),
+        ).fetchall()
+    
+        return [dict(row) for row in rows]
+
     def close(self) -> None:
         self.connection.close()
 

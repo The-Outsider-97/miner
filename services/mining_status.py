@@ -6,17 +6,17 @@ import ast
 import hashlib
 import json
 import os
+import httpx # type: ignore
+
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import httpx
-
 from ..utils.config_loader import get_config_section
 from ..utils.miner_errors import MinerError
 from ..utils.miner_helpers import PROJECT_ROOT, require_external_repository, run_checked
-from .artifact_submission import list_artifact_candidates
+from .submission_ledger import SubmissionLedger
 
 _TRACKED_BATCH_STATUSES = frozenset(("initializing", "running"))
 _PROVIDER_CALLS = frozenset(("llm_chat", "search_web", "fetch_page", "embed_text"))
@@ -87,12 +87,7 @@ def mining_status_snapshot(
         uploads=recorded_uploads,
     )
     target = _target_identity(candidate, recorded_uploads, harnyx_auth)
-
     local_artifact = _local_artifact_for_hash(_text(target.get("content_hash")))
-    providers = _complete_provider_state(
-        providers,
-        _artifact_required_providers(local_artifact),
-    )
 
     remote: dict[str, Any] = {}
     remote_error = False
@@ -109,6 +104,12 @@ def mining_status_snapshot(
 
     batch = _mapping(remote.get("batch"))
     matched_artifact = _mapping(remote.get("matched_artifact"))
+    if local_artifact is None:
+        local_artifact = _local_artifact_for_hash(
+            _text(matched_artifact.get("content_hash"))
+        )
+    
+    providers = _complete_provider_state(providers, _artifact_required_providers(local_artifact))
     candidate_status = (
         "current_candidate"
         if candidate
@@ -247,20 +248,22 @@ def _remote_lifecycle(
         if match:
             return match
 
-    if _text(target.get("artifact_id")) or _text(target.get("content_hash")):
-        for summary in completed[: _completed_scan_limit()]:
-            match = _batch_match(
-                client,
-                summary,
-                target=target,
-                uploads=uploads,
-                hotkey=hotkey,
-                uid=uid,
-                allow_identity_fallback=False,
-            )
-            if match:
-                return match
-
+    has_target_identity = bool(_text(target.get("artifact_id")) or _text(target.get("content_hash")))
+    
+    for summary in completed[: _completed_scan_limit()]:
+        match = _batch_match(
+            client,
+            summary,
+            target=target,
+            uploads=uploads,
+            hotkey=hotkey,
+            uid=uid,
+            allow_identity_fallback=not has_target_identity,
+        )
+    
+        if match:
+            return match
+    
     return {}
 
 
@@ -564,17 +567,198 @@ def _validator_execution_state(batch: Mapping[str, Any], artifact: Mapping[str, 
     return {"status": status, "validator_count": len(validators) if validators else None, "resolved_count": resolved if validators else None, "total_count": total if validators else None, "percent_complete": (resolved / total * 100.0) if total else None, "started_at": _text(progress.get("started_at")) or None, "stage": stage or None}
 
 
-def _evaluation_state(batch: Mapping[str, Any], artifact: Mapping[str, Any], comparison: Mapping[str, Any]) -> dict[str, Any]:
+def _evaluation_state(
+    batch: Mapping[str, Any],
+    artifact: Mapping[str, Any],
+    comparison: Mapping[str, Any],
+) -> dict[str, Any]:
     batch_status = _text(batch.get("status")).lower()
     stage = _text(batch.get("evaluation_stage")).lower()
-    explicit_main = _bool_first(artifact.get("main_admitted"), artifact.get("admitted_to_main"), comparison.get("main_admitted"), comparison.get("admitted_to_main"))
-    qualifying = "running" if stage == "qualifying" and batch_status == "running" else "pending" if stage == "qualifying" and batch_status == "initializing" else "complete" if explicit_main is True or stage == "main" or (batch_status == "completed" and stage == "qualifying") else "unknown"
-    main = "running" if explicit_main is True and batch_status == "running" else "complete" if explicit_main is True and batch_status == "completed" else "admitted" if explicit_main is True else "not_admitted" if explicit_main is False else "unknown" if stage == "main" and batch_status in {"running", "completed"} else "not_started"
-    total_score = _number_first(comparison.get("total_score"), artifact.get("total_score"), comparison.get("score"))
+
+    explicit_main = _bool_first(
+        artifact.get("main_admitted"),
+        artifact.get("admitted_to_main"),
+        comparison.get("main_admitted"),
+        comparison.get("admitted_to_main"),
+    )
+
+    qualifying = (
+        "running"
+        if stage == "qualifying"
+        and batch_status == "running"
+        else "pending"
+        if stage == "qualifying"
+        and batch_status == "initializing"
+        else "complete"
+        if (
+            explicit_main is True
+            or stage == "main"
+            or (
+                batch_status == "completed"
+                and stage == "qualifying"
+            )
+        )
+        else "unknown"
+    )
+
+    main = (
+        "running"
+        if explicit_main is True
+        and batch_status == "running"
+        else "complete"
+        if explicit_main is True
+        and batch_status == "completed"
+        else "admitted"
+        if explicit_main is True
+        else "not_admitted"
+        if explicit_main is False
+        else "unknown"
+        if (
+            stage == "main"
+            and batch_status in {
+                "running",
+                "completed",
+            }
+        )
+        else "not_started"
+    )
+
+    total_score = _number_first(
+        comparison.get("total_score"),
+        artifact.get("total_score"),
+        comparison.get("score"),
+    )
     error_counts = comparison.get("error_counts")
     if not isinstance(error_counts, Mapping):
         error_counts = artifact.get("error_counts")
-    return {"qualifying_status": qualifying, "main_status": main, "main_admitted": explicit_main, "final_status": "scored" if batch_status == "completed" and total_score is not None else "complete_score_unavailable" if batch_status == "completed" else "pending", "qualifying_score": _number_first(comparison.get("qualifying_score"), artifact.get("qualifying_score")), "total_score": total_score, "comparison_score": _number_first(comparison.get("comparison_score"), artifact.get("comparison_score")), "median_cost_usd": _number_first(comparison.get("median_cost_usd"), artifact.get("median_cost_usd"), comparison.get("cost_usd")), "total_cost_usd": _number_first(comparison.get("total_cost_usd"), artifact.get("total_cost_usd")), "median_runtime_ms": _number_first(comparison.get("median_elapsed_ms"), comparison.get("median_runtime_ms"), artifact.get("median_elapsed_ms"), artifact.get("median_runtime_ms")), "novelty_classification": _text(comparison.get("novelty_classification")) or _text(comparison.get("novelty")) or _text(artifact.get("novelty_classification")) or None, "error_counts": dict(error_counts) if isinstance(error_counts, Mapping) else None, "source": "harnyx_official_results" if comparison else "harnyx_batch_monitoring"}
+
+    similarity = _mapping(
+        comparison.get("similarity_round")
+    )
+
+    novelty_classification = (
+        _text(
+            similarity.get("classification")
+        )
+        or _text(
+            comparison.get(
+                "novelty_classification"
+            )
+        )
+        or _text(
+            comparison.get("novelty")
+        )
+        or _text(
+            artifact.get(
+                "novelty_classification"
+            )
+        )
+        or None
+    )
+
+    return {
+        "qualifying_status": qualifying,
+        "main_status": main,
+        "main_admitted": explicit_main,
+        "final_status": (
+            "scored"
+            if (
+                batch_status == "completed"
+                and total_score is not None
+            )
+            else "complete_score_unavailable"
+            if batch_status == "completed"
+            else "pending"
+        ),
+        "qualifying_score": _number_first(
+            comparison.get(
+                "qualifying_score"
+            ),
+            artifact.get(
+                "qualifying_score"
+            ),
+        ),
+        "total_score": total_score,
+        "comparison_score": _number_first(
+            comparison.get(
+                "comparison_score"
+            ),
+            artifact.get(
+                "comparison_score"
+            ),
+        ),
+        "median_cost_usd": _number_first(
+            comparison.get(
+                "median_cost_usd"
+            ),
+            artifact.get(
+                "median_cost_usd"
+            ),
+            comparison.get(
+                "cost_usd"
+            ),
+        ),
+        "total_cost_usd": _number_first(
+            comparison.get(
+                "total_cost_usd"
+            ),
+            artifact.get(
+                "total_cost_usd"
+            ),
+        ),
+        "median_runtime_ms": _number_first(
+            comparison.get(
+                "median_elapsed_ms"
+            ),
+            comparison.get(
+                "median_runtime_ms"
+            ),
+            artifact.get(
+                "median_elapsed_ms"
+            ),
+            artifact.get(
+                "median_runtime_ms"
+            ),
+        ),
+        "novelty_classification":
+            novelty_classification,
+        "reference_selection_outcome": (
+            _text(
+                comparison.get(
+                    "reference_selection_outcome"
+                )
+            )
+            or None
+        ),
+        "similarity_outcome": (
+            _text(
+                similarity.get("outcome")
+            )
+            or None
+        ),
+        "similarity_passes": _bool_first(
+            similarity.get("passes")
+        ),
+        "similarity_responding_validator_count":
+            _int_or_none(
+                similarity.get(
+                    "responding_validator_count"
+                )
+            ),
+        "error_counts": (
+            dict(error_counts)
+            if isinstance(
+                error_counts,
+                Mapping,
+            )
+            else None
+        ),
+        "source": (
+            "harnyx_official_results"
+            if comparison
+            else "harnyx_batch_monitoring"
+        ),
+    }
 
 
 def _allocation_state(comparison: Mapping[str, Any]) -> dict[str, Any]:
@@ -705,15 +889,8 @@ def _mcp_tool_payload(result: Mapping[str, Any]) -> Mapping[str, Any]:
 
 
 def _recorded_uploads() -> tuple[Mapping[str, Any], ...]:
-    uploads: list[Mapping[str, Any]] = []; seen: set[tuple[str, str]] = set()
-    for candidate in list_artifact_candidates():
-        previous = candidate.get("previous_upload")
-        if not isinstance(previous, Mapping): continue
-        artifact_id = _text(previous.get("platform_artifact_id")); content_hash = _text(previous.get("platform_content_hash")).lower()
-        if not artifact_id and not content_hash: continue
-        key = (artifact_id, content_hash)
-        if key not in seen: seen.add(key); uploads.append(previous)
-    return tuple(uploads)
+    with SubmissionLedger() as ledger:
+        return tuple(ledger.recent_uploads(limit=100))
 
 
 def _platform_base_url() -> str | None:
