@@ -117,15 +117,17 @@ function lifecycleSteps(mining: MiningState): Step[] {
         candidate === "current_candidate"
           ? "Current Harnyx candidate; awaiting finalized batch selection."
           : candidate === "moved_to_batch"
-            ? "Moved from the candidate view into batch membership."
-            : "Current-candidate status is not confirmed.",
+            ? "Artifact moved from the candidate view into finalized batch history."
+            : candidate === "not_current"
+              ? "No longer the current Harnyx candidate. Historical production state is retained below."
+              : "Current-candidate status is not confirmed.",
       state:
         candidate === "current_candidate"
           ? "current"
-          : candidate === "moved_to_batch" || batch
+          : candidate === "moved_to_batch"
             ? "complete"
             : candidate === "not_current"
-              ? "unknown"
+              ? "skipped"
               : "pending",
     },
     {
@@ -193,8 +195,15 @@ function lifecycleSteps(mining: MiningState): Step[] {
       label: "Final Score",
       detail:
         mining.evaluation.total_score !== null
-          ? `Total score ${number(mining.evaluation.total_score)}`
-          : title(mining.evaluation.final_status),
+          ? `Total score ${number(
+              mining.evaluation.total_score
+            )}`
+          : mining.evaluation.final_status ===
+              "complete_score_unavailable"
+            ? "Batch completed; Harnyx exposes no score for this artifact."
+            : title(
+                mining.evaluation.final_status
+              ),
       state:
         mining.evaluation.final_status === "scored"
           ? "complete"
@@ -332,7 +341,18 @@ export function MiningLifecycle({ mining, onRefresh }: Props) {
           <div className="integration-card__head">
             <h3>Batch / validators</h3>
             <span className="status-label">
-              <span className="status-dot" data-state={batch?.status === "running" ? "ready" : "empty"} aria-hidden="true" />
+              <span
+                className="status-dot"
+                data-state={
+                  batch?.status === "running" ||
+                  batch?.status === "completed"
+                    ? "ready"
+                    : batch?.status === "failed"
+                      ? "unavailable"
+                      : "empty"
+                }
+                aria-hidden="true"
+              />
               {batch ? title(batch.status) : "Not selected"}
             </span>
           </div>
@@ -356,10 +376,31 @@ export function MiningLifecycle({ mining, onRefresh }: Props) {
       </div>
 
       {mining.errors.length ? (
-        <div className="inline-notice subsection">
-          <span className="status-dot" data-state="unavailable" aria-hidden="true" />
-          <p>{mining.errors.join(" ")}</p>
-        </div>
+        <>
+          <div className="inline-notice subsection">
+            <span className="status-dot" data-state="unavailable" aria-hidden="true" />
+            <p>{mining.errors.join(" ")}</p>
+          </div>
+          <div className="metric">
+            <p>Novelty</p>
+            <strong>
+              {evaluation.novelty_classification
+                ? title(evaluation.novelty_classification)
+                : "Not available"}
+            </strong>
+          </div>
+
+          <div className="metric">
+            <p>Similarity preflight</p>
+            <strong>
+              {evaluation.similarity_passes === true
+                ? `Passed${evaluation.similarity_responding_validator_count !== null ? ` · ${evaluation.similarity_responding_validator_count} validators` : ""}`
+                : evaluation.similarity_passes === false
+                  ? "Failed"
+                  : "Not available"}
+            </strong>
+          </div>
+        </>
       ) : null}
     </>
   );

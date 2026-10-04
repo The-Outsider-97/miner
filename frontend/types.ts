@@ -143,8 +143,10 @@ export type MiningEvaluationState = {
   total_cost_usd: number | null;
   median_runtime_ms: number | null;
   novelty_classification: string | null;
-  error_counts: Record<string, number> | null;
-  source: string;
+  reference_selection_outcome: string | null;
+  similarity_outcome: string | null;
+  similarity_passes: boolean | null;
+  similarity_responding_validator_count: number | null;  
 };
 
 export type MiningAllocationState = {
