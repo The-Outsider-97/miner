@@ -34,6 +34,11 @@ submission:
   hotkey_name_env: HARNYX_HOTKEY_NAME
   ledger_path: state/submissions.sqlite3
 
+  monitoring_timeout_seconds: 8.0
+  monitoring_mcp_timeout_seconds: 12.0
+  monitoring_batch_limit: 25
+  monitoring_completed_scan_limit: 20
+
 external:
   slai:
     path: external/slai
