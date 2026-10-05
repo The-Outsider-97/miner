@@ -11,7 +11,6 @@ import json
 import subprocess
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 from ..utils.miner_helpers import PROJECT_ROOT
