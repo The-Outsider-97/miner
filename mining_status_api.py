@@ -4,6 +4,22 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
+from pathlib import Path
+
+# Support direct invocation from the repository root:
+#     uv run python mining_status_api.py --json
+#     uv run python -m mining_status_api --json
+#
+# The repository itself is intentionally not installed as a package. When this
+# module is executed directly/top-level, relative imports would otherwise fail.
+# Bootstrap the checkout as a package in the same way as slai_miner.py.
+if __package__ in {None, ""}:
+    package_root = Path(__file__).resolve().parent
+    parent = str(package_root.parent)
+    if parent not in sys.path:
+        sys.path.insert(0, parent)
+    __package__ = package_root.name
 
 from .services.bittensor_state import build_bittensor_snapshot
 from .services.mining_status import mining_status_snapshot
