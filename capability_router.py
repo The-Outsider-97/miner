@@ -86,15 +86,14 @@ def route_capabilities(text: str, *, fast: bool = False) -> CapabilityPlan:
 
     if fast:
         depth = "lightweight"
+    elif evidentiary and length >= 45:
+        depth = "exhaustive"
     elif comparative or uncertainty or (structured and length >= 18):
         depth = "deep"
     elif evidentiary or temporal or structured or length >= 10:
         depth = "standard"
     else:
         depth = "lightweight"
-
-    if depth == "deep" and length >= 45 and evidentiary:
-        depth = "exhaustive"
 
     browse = temporal or evidentiary or depth in {"deep", "exhaustive"}
     verify = uncertainty or comparative or depth in {"deep", "exhaustive"}
