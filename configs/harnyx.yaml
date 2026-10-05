@@ -3,6 +3,13 @@ project:
   netuid: 67
   results_database: benchmarks/harnyx/results/miner_benchmarks.sqlite3
 
+bittensor:
+  # Public wallet/hotkey names only. No seed phrase, private key, password, or
+  # signing material is ever exposed to the dashboard integration.
+  wallet_name: slai
+  hotkey_name: sn67
+  query_timeout_seconds: 12.0
+
 market:
   asset_symbol: TAO
   currencies:
