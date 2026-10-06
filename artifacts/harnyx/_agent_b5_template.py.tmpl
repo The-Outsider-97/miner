@@ -1,0 +1,1319 @@
+from __future__ import annotations
+
+import json
+import re
+import time
+
+from harnyx_miner_sdk.api import fetch_page, llm_chat, search_web, tooling_info
+from harnyx_miner_sdk.context import ContextSnapshot
+from harnyx_miner_sdk.decorators import entrypoint
+from harnyx_miner_sdk.query import CitationRef, Query, Response
+from harnyx_miner_sdk.structured_output import validate_output_against_schema
+
+
+PROFILE = __PROFILE_JSON__
+
+_MARKER = re.compile(r"\[\[(\d+)\]\]")
+_WORD = re.compile(r"[a-z0-9]{3,}")
+_SENTENCE = re.compile(r"(?<=[.!?])\s+")
+
+_MAX_SEARCH_QUERIES = 3
+_MAX_FETCH_PAGES = 3
+_MAX_PAGE_CHARS = 14000
+_MAX_TOTAL_EVIDENCE_CHARS = 32000
+
+_SEARCH_FALLBACKS = (
+    "exa",
+    "tavily",
+    "firecrawl",
+    "desearch",
+)
+
+
+def _normalize(text: str) -> str:
+    return " ".join((text or "").split()).strip()
+
+
+def _task_policy(query: Query):
+    text = _normalize(query.text.lower())
+    words = _WORD.findall(text)
+
+    comparative = any(
+        token in text
+        for token in (
+            "compare",
+            "comparison",
+            "versus",
+            " vs ",
+            "difference",
+            "change between",
+            "largest increase",
+            "largest decrease",
+            "increase and decrease",
+            "restatement",
+            "changed from",
+            "changed between",
+            "trade-off",
+            "tradeoff",
+        )
+    )
+
+    temporal = any(
+        token in text
+        for token in (
+            "latest",
+            "current",
+            "today",
+            "recent",
+            "as of",
+            "this week",
+            "this month",
+            "this year",
+            "updated",
+            "published",
+        )
+    )
+
+    evidentiary = any(
+        token in text
+        for token in (
+            "source",
+            "evidence",
+            "citation",
+            "research",
+            "study",
+            "paper",
+            "report",
+            "table",
+            "document",
+            "publication",
+            "dataset",
+            "inventory",
+            "registry",
+            "standard",
+            "statistics",
+            "annual report",
+            "weekly report",
+            "according to",
+        )
+    )
+
+    analytical = any(
+        token in text
+        for token in (
+            "analyze",
+            "analyse",
+            "assess",
+            "evaluate",
+            "recommend",
+            "feasibility",
+            "architecture",
+            "strategy",
+            "calculate",
+            "compute",
+            "identify",
+            "determine",
+        )
+    )
+
+    uncertain = any(
+        token in text
+        for token in (
+            "uncertain",
+            "controvers",
+            "conflict",
+            "ambiguous",
+            "risk",
+            "disputed",
+        )
+    )
+
+    document_heavy = any(
+        token in text
+        for token in (
+            "table",
+            "pdf",
+            "report",
+            "publication",
+            "dataset",
+            "registry",
+            "inventory",
+            "list",
+            "statistics",
+        )
+    )
+
+    if query.fast:
+        depth = "lightweight"
+    elif comparative or uncertain or document_heavy:
+        depth = "deep"
+    elif temporal or evidentiary or analytical or len(words) >= 12:
+        depth = "standard"
+    else:
+        depth = "lightweight"
+
+    needs_retrieval = bool(
+        PROFILE["retrieval"]
+        and (
+            temporal
+            or evidentiary
+            or comparative
+            or document_heavy
+            or depth == "deep"
+        )
+    )
+
+    return {
+        "depth": depth,
+        "comparative": comparative,
+        "document_heavy": document_heavy,
+        "needs_retrieval": needs_retrieval,
+        "needs_plan": bool(
+            PROFILE["decomposition"]
+            and needs_retrieval
+            and depth in ("standard", "deep")
+        ),
+        "needs_verification": bool(
+            PROFILE["verification"]
+            and (needs_retrieval or comparative or uncertain or depth == "deep")
+        ),
+        "search_results": (
+            PROFILE["search_results"]
+            if depth == "deep"
+            else max(3, PROFILE["search_results"] // 2)
+        ),
+        "evidence_limit": (
+            PROFILE["evidence_limit"]
+            if depth == "deep"
+            else max(2, PROFILE["evidence_limit"] // 2)
+        ),
+        "fetch_pages": (
+            _MAX_FETCH_PAGES
+            if depth == "deep"
+            else min(2, _MAX_FETCH_PAGES)
+        ),
+    }
+
+
+def _answer_prompt(
+    query: Query,
+    evidence: str,
+    plan: str,
+    retrieval_required: bool,
+) -> str:
+    if query.fast:
+        instruction = (
+            "Answer every required component directly and correctly. "
+            "Be concise. Do not invent citations or unsupported facts."
+        )
+    elif evidence:
+        instruction = (
+            "Answer as a careful research assistant. "
+            "Use the supplied evidence for externally verifiable facts. "
+            "For comparisons between reports, tables, versions, datasets, or dates, "
+            "align the exact same row/field/column across the relevant sources, "
+            "extract the required values, perform the calculation explicitly, "
+            "and only then select maxima, minima, increases, decreases, or differences. "
+            "Preserve labels exactly when the question requires exact labels. "
+            "Do not substitute a similar category for an exact category. "
+            "Use only the exact [[n]] citation markers supplied with the evidence "
+            "when prose citations are appropriate."
+        )
+    elif retrieval_required:
+        instruction = (
+            "External evidence was required but no reliable retrieval evidence was obtained. "
+            "Do not invent sources or citations. "
+            "Answer only if the result can still be derived reliably; otherwise express "
+            "the uncertainty while still respecting the requested output format."
+        )
+    else:
+        instruction = (
+            "Answer accurately and self-contained. "
+            "Do not invent citations. "
+            "State material uncertainty briefly."
+        )
+
+    if query.output_schema is not None:
+        instruction += (
+            " Return ONLY one JSON value matching this JSON Schema exactly; "
+            "no Markdown fence, commentary, or extra keys: "
+            + json.dumps(
+                query.output_schema,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+
+    parts = [
+        instruction,
+        "QUESTION:\n" + query.text,
+    ]
+
+    if plan:
+        parts.append("RESEARCH CHECKS:\n" + plan)
+
+    if evidence:
+        parts.append("EVIDENCE:\n" + evidence)
+
+    return "\n\n".join(parts)
+
+
+def _parse_json(text: str):
+    value = (text or "").strip()
+
+    if value.startswith("```"):
+        newline = value.find("\n")
+        if newline >= 0:
+            value = value[newline + 1 :]
+        if value.endswith("```"):
+            value = value[:-3]
+
+    return json.loads(value.strip())
+
+
+def _schema_fallback(schema):
+    if "const" in schema:
+        return schema["const"]
+
+    enum = schema.get("enum")
+    if isinstance(enum, list) and enum:
+        return enum[0]
+
+    for keyword in ("oneOf", "anyOf"):
+        variants = schema.get(keyword)
+        if isinstance(variants, list) and variants:
+            return _schema_fallback(variants[0])
+
+    kind = schema.get("type")
+
+    if isinstance(kind, list):
+        if "null" in kind:
+            return None
+        kind = kind[0] if kind else None
+
+    if kind == "object" or "properties" in schema:
+        properties = schema.get("properties") or {}
+        return {
+            key: _schema_fallback(properties.get(key) or {})
+            for key in (schema.get("required") or [])
+        }
+
+    if kind == "array":
+        minimum = schema.get("minItems") or 0
+        return [
+            _schema_fallback(schema.get("items") or {})
+            for _ in range(minimum)
+        ]
+
+    if kind == "integer":
+        return int(schema.get("minimum") or 0)
+
+    if kind == "number":
+        return float(schema.get("minimum") or 0.0)
+
+    if kind == "boolean":
+        return False
+
+    if kind == "null":
+        return None
+
+    return "Unavailable"
+
+
+def _sanitize_markers(text: str, count: int) -> str:
+    def replace(match):
+        index = int(match.group(1))
+        return match.group(0) if 1 <= index <= count else ""
+
+    return _MARKER.sub(replace, text).strip()
+
+
+def _domain(url: str) -> str:
+    value = (url or "").lower().strip()
+
+    if "://" in value:
+        value = value.split("://", 1)[1]
+
+    return value.split("/", 1)[0].removeprefix("www.")
+
+
+def _source_score(item, query_words):
+    title = _normalize(item.title or "").lower()
+    note = _normalize(item.note or "").lower()
+    url = (item.url or "").lower()
+    domain = _domain(url)
+
+    haystack = title + " " + note + " " + url
+    overlap = sum(
+        1
+        for word in query_words
+        if word in haystack
+    )
+
+    authority = 0
+
+    if (
+        domain.endswith(".gov")
+        or domain.endswith(".gov.uk")
+        or domain.endswith(".edu")
+        or domain.endswith(".ac.uk")
+        or domain.endswith(".europa.eu")
+    ):
+        authority = 5
+    elif any(
+        token in domain
+        for token in (
+            "who.int",
+            "oecd.org",
+            "worldbank.org",
+            "nasa.gov",
+            "usgs.gov",
+            "nist.gov",
+            "loc.gov",
+            "fide.com",
+            "uci.org",
+            "ecma-international.org",
+        )
+    ):
+        authority = 4
+    elif any(
+        token in domain
+        for token in (
+            "nature.com",
+            "science.org",
+            "reuters.com",
+        )
+    ):
+        authority = 3
+    elif domain:
+        authority = 1
+
+    substance = min(len(note), 2400) // 300
+
+    return (
+        authority * 100
+        + overlap * 10
+        + substance
+    )
+
+
+def _select_search_results(results, query_text: str, limit: int):
+    query_words = set(_WORD.findall(query_text.lower()))
+
+    seen_urls = set()
+    selected = []
+
+    for item in results:
+        url = (item.url or "").strip()
+        title = _normalize(item.title or "")
+        note = _normalize(item.note or "")
+
+        if not url:
+            continue
+
+        key = url.lower()
+
+        if key in seen_urls:
+            continue
+
+        seen_urls.add(key)
+
+        selected.append(
+            (
+                _source_score(item, query_words),
+                item,
+                title,
+                note,
+            )
+        )
+
+    if PROFILE["evidence_ranking"]:
+        selected.sort(
+            key=lambda record: record[0],
+            reverse=True,
+        )
+
+    return [
+        record[1]
+        for record in selected[:limit]
+    ]
+
+
+def _provider_order(preferred: str | None = None):
+    providers = []
+
+    for provider in (
+        preferred,
+        PROFILE["search_provider"],
+        *_SEARCH_FALLBACKS,
+    ):
+        if not provider:
+            continue
+
+        if provider not in providers:
+            providers.append(provider)
+
+    return providers
+
+
+def _remaining_seconds(
+    started: float,
+    time_limit_seconds: float,
+    reserve: float = 1.0,
+) -> float:
+    return max(
+        1.0,
+        time_limit_seconds
+        - (time.monotonic() - started)
+        - reserve,
+    )
+
+
+def _bounded_timeout(
+    started: float,
+    time_limit_seconds: float,
+    reserve: float,
+) -> float:
+    return max(
+        1.0,
+        min(
+            PROFILE["tool_timeout_seconds"],
+            _remaining_seconds(
+                started,
+                time_limit_seconds,
+                reserve,
+            ),
+        ),
+    )
+
+
+async def _route():
+    default = PROFILE["routes"][0]
+
+    if not PROFILE["provider_routing"]:
+        return default
+
+    try:
+        info = await tooling_info(timeout=5.0)
+    except Exception:
+        return default
+
+    allowed = (
+        info.response.get("allowed_llm_provider_models")
+        or {}
+    )
+
+    for route in PROFILE["routes"]:
+        if route["model"] in (
+            allowed.get(route["provider"])
+            or []
+        ):
+            return route
+
+    return default
+
+
+
+def _llm_route_order(route):
+    routes = []
+
+    for candidate in (
+        route,
+        *PROFILE["routes"],
+    ):
+        if candidate not in routes:
+            routes.append(candidate)
+
+    return routes
+
+
+async def _chat(
+    route,
+    prompt: str,
+    tokens: int,
+    timeout: float,
+):
+    for candidate in _llm_route_order(route)[:3]:
+        try:
+            result = await llm_chat(
+                provider=candidate["provider"],
+                model=candidate["model"],
+                messages=[
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    }
+                ],
+                temperature=0.0,
+                max_output_tokens=tokens,
+                timeout=max(
+                    1.0,
+                    min(
+                        PROFILE["tool_timeout_seconds"],
+                        timeout,
+                    ),
+                ),
+            )
+
+            return (
+                (result.llm.raw_text or "").strip(),
+                result.budget.session_remaining_budget_usd,
+            )
+
+        except Exception:
+            continue
+
+    return "", None
+
+
+def _fallback_queries(text: str):
+    normalized = _normalize(text)
+
+    if not normalized:
+        return []
+
+    sentences = [
+        _normalize(part)
+        for part in _SENTENCE.split(normalized)
+        if _normalize(part)
+    ]
+
+    preferred = []
+
+    for sentence in sentences:
+        lower = sentence.lower()
+
+        if any(
+            token in lower
+            for token in (
+                "report",
+                "table",
+                "week ",
+                "publication",
+                "dataset",
+                "registry",
+                "inventory",
+                "standard",
+                "compare",
+            )
+        ):
+            preferred.append(sentence[:320])
+
+        if len(preferred) >= _MAX_SEARCH_QUERIES:
+            break
+
+    if preferred:
+        return preferred
+
+    return [normalized[:320]]
+
+
+def _parse_research_plan(
+    raw: str,
+    query_text: str,
+):
+    queries = []
+    checks = []
+
+    try:
+        payload = _parse_json(raw)
+
+        raw_queries = payload.get("queries")
+        raw_checks = payload.get("checks")
+
+        if isinstance(raw_queries, list):
+            for item in raw_queries:
+                if isinstance(item, str):
+                    value = _normalize(item)
+
+                    if value and value not in queries:
+                        queries.append(value[:320])
+
+                    if len(queries) >= _MAX_SEARCH_QUERIES:
+                        break
+
+        if isinstance(raw_checks, list):
+            for item in raw_checks:
+                if isinstance(item, str):
+                    value = _normalize(item)
+
+                    if value:
+                        checks.append(value)
+
+                    if len(checks) >= 4:
+                        break
+
+    except (
+        json.JSONDecodeError,
+        ValueError,
+        TypeError,
+        AttributeError,
+    ):
+        pass
+
+    if not queries:
+        queries = _fallback_queries(query_text)
+
+    return (
+        queries[:_MAX_SEARCH_QUERIES],
+        "\n".join(
+            "- " + check
+            for check in checks
+        ),
+    )
+
+
+async def _research_plan(
+    query: Query,
+    route,
+    policy,
+    remaining: float,
+    started: float,
+    time_limit_seconds: float,
+):
+    if not policy["needs_plan"]:
+        return (
+            _fallback_queries(query.text),
+            "",
+            remaining,
+        )
+
+    prompt = (
+        "Create a compact retrieval plan for the question below. "
+        "Return ONLY JSON with this exact shape: "
+        '{"queries":["search query 1","search query 2"],'
+        '"checks":["factual check 1","factual check 2"]}. '
+        "Use at most 3 search queries and at most 4 factual checks. "
+        "Search queries should target the exact primary documents, organizations, "
+        "dates, versions, tables, reports, standards, datasets, or records needed. "
+        "For comparison questions, create queries that can locate each side of "
+        "the comparison separately. Do not answer the question.\n\n"
+        "QUESTION:\n"
+        + query.text
+    )
+
+    planned, updated = await _chat(
+        route,
+        prompt,
+        PROFILE["analysis_max_output_tokens"],
+        _bounded_timeout(
+            started,
+            time_limit_seconds,
+            PROFILE["minimum_final_seconds"],
+        ),
+    )
+
+    if updated is not None:
+        remaining = updated
+
+    queries, checks = _parse_research_plan(
+        planned,
+        query.text,
+    )
+
+    return queries, checks, remaining
+
+
+async def _search_with_failover(
+    queries,
+    policy,
+    remaining: float,
+    started: float,
+    time_limit_seconds: float,
+):
+    if not queries:
+        return None, None, remaining
+
+    for provider in _provider_order():
+        if (
+            _remaining_seconds(
+                started,
+                time_limit_seconds,
+                PROFILE["minimum_final_seconds"],
+            )
+            <= 1.0
+        ):
+            break
+
+        try:
+            result = await search_web(
+                queries,
+                provider=provider,
+                num=policy["search_results"],
+                timeout=_bounded_timeout(
+                    started,
+                    time_limit_seconds,
+                    PROFILE["minimum_final_seconds"],
+                ),
+            )
+
+            remaining = (
+                result.budget.session_remaining_budget_usd
+            )
+
+            if result.results:
+                return result, provider, remaining
+
+        except Exception:
+            continue
+
+    return None, None, remaining
+
+
+async def _fetch_with_failover(
+    url: str,
+    preferred_provider: str | None,
+    remaining: float,
+    started: float,
+    time_limit_seconds: float,
+):
+    for provider in _provider_order(
+        preferred_provider,
+    ):
+        if (
+            _remaining_seconds(
+                started,
+                time_limit_seconds,
+                PROFILE["minimum_final_seconds"],
+            )
+            <= 1.0
+        ):
+            break
+
+        try:
+            page = await fetch_page(
+                url,
+                provider=provider,
+                timeout=_bounded_timeout(
+                    started,
+                    time_limit_seconds,
+                    PROFILE["minimum_final_seconds"],
+                ),
+            )
+
+            remaining = (
+                page.budget.session_remaining_budget_usd
+            )
+
+            if page.response.data:
+                return page, provider, remaining
+
+        except Exception:
+            continue
+
+    return None, None, remaining
+
+
+def _clean_page_content(text: str) -> str:
+    value = (text or "").replace("\x00", "").strip()
+
+    if len(value) > _MAX_PAGE_CHARS:
+        value = value[:_MAX_PAGE_CHARS]
+
+    return value
+
+
+async def _evidence(
+    query: Query,
+    queries,
+    checks: str,
+    policy,
+    remaining: float,
+    started: float,
+    time_limit_seconds: float,
+):
+    if not policy["needs_retrieval"]:
+        return "", [], remaining
+
+    search, search_provider, remaining = await _search_with_failover(
+        queries,
+        policy,
+        remaining,
+        started,
+        time_limit_seconds,
+    )
+
+    if search is None:
+        return "", [], remaining
+
+    candidates = _select_search_results(
+        search.results,
+        query.text,
+        max(
+            policy["evidence_limit"],
+            policy["fetch_pages"],
+        ),
+    )
+
+    evidence_parts = []
+    citations = []
+    evidence_chars = 0
+
+    for item in candidates[: policy["fetch_pages"]]:
+        if evidence_chars >= _MAX_TOTAL_EVIDENCE_CHARS:
+            break
+
+        url = (item.url or "").strip()
+
+        if not url:
+            continue
+
+        page, _, remaining = await _fetch_with_failover(
+            url,
+            search_provider,
+            remaining,
+            started,
+            time_limit_seconds,
+        )
+
+        if page is not None and page.response.data:
+            datum = page.response.data[0]
+            content = _clean_page_content(
+                datum.content,
+            )
+
+            if content:
+                reference = (
+                    page.results[0]
+                    if page.results
+                    else None
+                )
+
+                if reference is not None:
+                    citations.append(
+                        CitationRef(
+                            receipt_id=page.receipt_id,
+                            result_id=reference.result_id,
+                        )
+                    )
+
+                    marker = "[[" + str(len(citations)) + "]]"
+                    title = (
+                        datum.title
+                        or item.title
+                        or url
+                    )
+
+                    allowance = max(
+                        0,
+                        _MAX_TOTAL_EVIDENCE_CHARS
+                        - evidence_chars,
+                    )
+
+                    content = content[:allowance]
+
+                    evidence_parts.append(
+                        "SOURCE "
+                        + str(len(citations))
+                        + " "
+                        + marker
+                        + " "
+                        + _normalize(title)
+                        + "\nURL: "
+                        + url
+                        + "\n"
+                        + content
+                    )
+
+                    evidence_chars += len(content)
+                    continue
+
+        note = _normalize(item.note or "")
+
+        if not note:
+            continue
+
+        citations.append(
+            CitationRef(
+                receipt_id=search.receipt_id,
+                result_id=item.result_id,
+            )
+        )
+
+        marker = "[[" + str(len(citations)) + "]]"
+
+        evidence_parts.append(
+            "SOURCE "
+            + str(len(citations))
+            + " "
+            + marker
+            + " "
+            + _normalize(item.title or url)
+            + "\nURL: "
+            + url
+            + "\n"
+            + note[:2400]
+        )
+
+        evidence_chars += min(
+            len(note),
+            2400,
+        )
+
+    if not evidence_parts:
+        for item in candidates[: policy["evidence_limit"]]:
+            note = _normalize(item.note or "")
+            url = (item.url or "").strip()
+
+            if not note or not url:
+                continue
+
+            citations.append(
+                CitationRef(
+                    receipt_id=search.receipt_id,
+                    result_id=item.result_id,
+                )
+            )
+
+            marker = "[[" + str(len(citations)) + "]]"
+
+            evidence_parts.append(
+                "SOURCE "
+                + str(len(citations))
+                + " "
+                + marker
+                + " "
+                + _normalize(item.title or url)
+                + "\nURL: "
+                + url
+                + "\n"
+                + note[:2400]
+            )
+
+    if checks:
+        evidence_parts.insert(
+            0,
+            "REQUIRED FACTUAL CHECKS:\n" + checks,
+        )
+
+    return (
+        "\n\n".join(evidence_parts),
+        citations,
+        remaining,
+    )
+
+
+async def _structured(
+    query: Query,
+    route,
+    raw: str,
+    remaining: float,
+    started: float,
+    time_limit_seconds: float,
+):
+    schema = query.output_schema or {}
+
+    try:
+        output = _parse_json(raw)
+        validate_output_against_schema(
+            output,
+            schema,
+        )
+        return output, remaining
+
+    except (
+        json.JSONDecodeError,
+        ValueError,
+        TypeError,
+    ):
+        pass
+
+    if (
+        _remaining_seconds(
+            started,
+            time_limit_seconds,
+            PROFILE["minimum_final_seconds"],
+        )
+        <= 1.0
+    ):
+        return (
+            _schema_fallback(schema),
+            remaining,
+        )
+
+    repair = (
+        "Repair this candidate into exactly one JSON value matching the schema. "
+        "Do not add commentary. Return JSON only.\n\n"
+        "SCHEMA:\n"
+        + json.dumps(
+            schema,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        + "\n\nCANDIDATE:\n"
+        + raw
+    )
+
+    fixed, updated = await _chat(
+        route,
+        repair,
+        PROFILE["normal_max_output_tokens"],
+        _bounded_timeout(
+            started,
+            time_limit_seconds,
+            PROFILE["minimum_final_seconds"],
+        ),
+    )
+
+    if updated is not None:
+        remaining = updated
+
+    try:
+        output = _parse_json(fixed)
+        validate_output_against_schema(
+            output,
+            schema,
+        )
+        return output, remaining
+
+    except (
+        json.JSONDecodeError,
+        ValueError,
+        TypeError,
+    ):
+        return (
+            _schema_fallback(schema),
+            remaining,
+        )
+
+
+async def _verify(
+    query: Query,
+    route,
+    answer,
+    evidence: str,
+    policy,
+    remaining: float,
+    started: float,
+    time_limit_seconds: float,
+    minimum_budget_reserve_usd: float,
+):
+    if not policy["needs_verification"]:
+        return answer, remaining
+
+    if policy["needs_retrieval"] and not evidence:
+        return answer, remaining
+
+    elapsed = time.monotonic() - started
+
+    if (
+        remaining <= minimum_budget_reserve_usd
+        or time_limit_seconds - elapsed
+        <= PROFILE["minimum_final_seconds"]
+    ):
+        return answer, remaining
+
+    if query.output_schema is not None:
+        prompt = (
+            "Verify the candidate against the question and retrieved evidence. "
+            "For numerical/table comparisons, recompute the required values from "
+            "the evidence before accepting the candidate. Correct only material "
+            "errors. Preserve exact labels required by the question. "
+            "Return JSON only.\n\n"
+            "QUESTION:\n"
+            + query.text
+            + "\n\nEVIDENCE:\n"
+            + evidence
+            + "\n\nSCHEMA:\n"
+            + json.dumps(
+                query.output_schema,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            + "\n\nCANDIDATE:\n"
+            + json.dumps(
+                answer,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+    else:
+        prompt = (
+            "Verify the candidate against the question and retrieved evidence. "
+            "Correct material factual, calculation, support, or coverage errors. "
+            "For comparisons, recompute values from the cited evidence. "
+            "Remove unsupported assertions. Preserve valid [[n]] citation markers. "
+            "Return only the corrected answer.\n\n"
+            "QUESTION:\n"
+            + query.text
+            + "\n\nEVIDENCE:\n"
+            + evidence
+            + "\n\nCANDIDATE:\n"
+            + str(answer)
+        )
+
+    checked, updated = await _chat(
+        route,
+        prompt,
+        PROFILE["verification_max_output_tokens"],
+        _bounded_timeout(
+            started,
+            time_limit_seconds,
+            1.0,
+        ),
+    )
+
+    if updated is not None:
+        remaining = updated
+
+    if not checked:
+        return answer, remaining
+
+    if query.output_schema is None:
+        return checked, remaining
+
+    try:
+        output = _parse_json(checked)
+
+        validate_output_against_schema(
+            output,
+            query.output_schema,
+        )
+
+        return output, remaining
+
+    except (
+        json.JSONDecodeError,
+        ValueError,
+        TypeError,
+    ):
+        return answer, remaining
+
+
+@entrypoint("query")
+async def query(
+    query: Query,
+    context: ContextSnapshot,
+) -> Response:
+    started = time.monotonic()
+
+    remaining = (
+        context.cost_budget.session_remaining_budget_usd
+    )
+
+    time_limit_seconds = (
+        context.time_budget.limit_seconds
+    )
+
+    minimum_budget_reserve_usd = max(
+        0.005,
+        context.cost_budget.session_budget_usd
+        * PROFILE["reserve_budget_fraction"],
+    )
+
+    policy = _task_policy(query)
+    route = await _route()
+
+    search_queries, plan, remaining = await _research_plan(
+        query,
+        route,
+        policy,
+        remaining,
+        started,
+        time_limit_seconds,
+    )
+
+    evidence, citations, remaining = await _evidence(
+        query,
+        search_queries,
+        plan,
+        policy,
+        remaining,
+        started,
+        time_limit_seconds,
+    )
+
+    raw, updated = await _chat(
+        route,
+        _answer_prompt(
+            query,
+            evidence,
+            plan,
+            policy["needs_retrieval"],
+        ),
+        (
+            PROFILE["fast_max_output_tokens"]
+            if query.fast
+            else PROFILE["normal_max_output_tokens"]
+        ),
+        _bounded_timeout(
+            started,
+            time_limit_seconds,
+            1.0,
+        ),
+    )
+
+    if updated is not None:
+        remaining = updated
+
+    if query.output_schema is not None:
+        output, remaining = await _structured(
+            query,
+            route,
+            raw,
+            remaining,
+            started,
+            time_limit_seconds,
+        )
+
+        output, remaining = await _verify(
+            query,
+            route,
+            output,
+            evidence,
+            policy,
+            remaining,
+            started,
+            time_limit_seconds,
+            minimum_budget_reserve_usd,
+        )
+
+        return Response(
+            output=output,
+            citations=citations or None,
+        )
+
+    if not raw:
+        raw = (
+            "No reliable answer was produced within "
+            "the available tool and cost budget."
+        )
+
+    answer = _sanitize_markers(
+        raw,
+        len(citations),
+    )
+
+    answer, remaining = await _verify(
+        query,
+        route,
+        answer,
+        evidence,
+        policy,
+        remaining,
+        started,
+        time_limit_seconds,
+        minimum_budget_reserve_usd,
+    )
+
+    answer = _sanitize_markers(
+        str(answer),
+        len(citations),
+    )
+
+    if citations and "[[" not in answer:
+        answer += (
+            "\n\nSources: "
+            + "".join(
+                "[[" + str(index) + "]]"
+                for index in range(
+                    1,
+                    len(citations) + 1,
+                )
+            )
+        )
+
+    return Response(
+        text=answer,
+        citations=citations or None,
+    )

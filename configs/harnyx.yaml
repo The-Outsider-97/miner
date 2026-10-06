@@ -115,6 +115,13 @@ artifact:
       retrieval: true
       evidence_ranking: true
       verification: true
+    b5:
+      description: Hardened research profile with targeted planning, bounded search-provider failover, page fetching, evidence extraction, and evidence-gated verification.
+      provider_routing: true
+      decomposition: true
+      retrieval: true
+      evidence_ranking: true
+      verification: true
 
 slai:
   # These are the only current Miner hot-path experiment candidates exposed by

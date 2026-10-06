@@ -27,12 +27,12 @@ if __package__ in {None, ""}:
         sys.path.insert(0, parent)
     __package__ = package_root.name
 
-from .artifact_builder import build_all, build_artifact
-from .benchmark_store import BenchmarkStore
-from .utils.config_loader import get_config_section
-from .utils.miner_errors import BenchmarkExecutionError, MinerConfigurationError, MinerError
-from .utils.miner_helpers import PROJECT_ROOT, require_external_repository, run_checked
-from .utils.repository_state import benchmark_database_path, dependency_status, repository_commits
+from .artifact_builder import build_all, build_artifact # type: ignore
+from .benchmark_store import BenchmarkStore # type: ignore
+from .utils.config_loader import get_config_section # type: ignore
+from .utils.miner_errors import BenchmarkExecutionError, MinerConfigurationError, MinerError # type: ignore
+from .utils.miner_helpers import PROJECT_ROOT, require_external_repository, run_checked # type: ignore
+from .utils.repository_state import benchmark_database_path, dependency_status, repository_commits # type: ignore
 
 _ARTIFACT_COMPONENTS = (
     "provider_routing",
@@ -76,9 +76,7 @@ def _summary(stdout: str) -> dict[str, Any]:
             continue
         if isinstance(value, dict):
             return value
-    raise BenchmarkExecutionError(
-        "official Harnyx command did not emit a machine-readable JSON summary"
-    )
+    raise BenchmarkExecutionError("official Harnyx command did not emit a machine-readable JSON summary")
 
 
 def _harnyx_command_settings(name: str) -> Mapping[str, Any]:
@@ -278,7 +276,7 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser("status")
 
     build = commands.add_parser("build")
-    build.add_argument("profile", choices=["b0", "b1", "b2", "b3", "b4", "all"])
+    build.add_argument("profile", choices=["b0", "b1", "b2", "b3", "b4", "b5", "all"])
     build.add_argument("--official-validate", action="store_true")
     build.add_argument(
         "--disable",
@@ -341,7 +339,7 @@ def main(argv: list[str] | None = None) -> int:
                     disabled_components=tuple(args.disable),
                 ).to_dict()
         elif args.command == "slai-smoke":
-            from .adapters.slai import SlaiRuntime
+            from .adapters.slai import SlaiRuntime # type: ignore
 
             agents = list(args.agent)
             if args.reason and "reasoning" not in agents:

@@ -15,12 +15,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .utils.config_loader import get_config_section, load_config
-from .utils.miner_errors import ArtifactBuildError, ArtifactValidationError
-from .utils.miner_helpers import PROJECT_ROOT, git_head, require_external_repository, run_checked
+from .utils.config_loader import get_config_section, load_config # type: ignore
+from .utils.miner_errors import ArtifactBuildError, ArtifactValidationError # type: ignore
+from .utils.miner_helpers import PROJECT_ROOT, git_head, require_external_repository, run_checked # type: ignore
 
 _ARTIFACT_ROOT = PROJECT_ROOT / "artifacts" / "harnyx"
 _TEMPLATE = _ARTIFACT_ROOT / "_agent_template.py.tmpl"
+_B5_TEMPLATE = _ARTIFACT_ROOT / "_agent_b5_template.py.tmpl"
 _BASELINE = _ARTIFACT_ROOT / "baseline_agent.py"
 _MANIFEST_ROOT = PROJECT_ROOT / "benchmarks" / "harnyx" / "manifests"
 _FILENAMES = {
@@ -29,6 +30,7 @@ _FILENAMES = {
     "b2": "b2_agent.py",
     "b3": "b3_agent.py",
     "b4": "b4_agent.py",
+    "b5": "b5_agent.py",
 }
 _ABLATIONS = {
     "provider_routing",
@@ -125,8 +127,15 @@ def build_artifact(
         profile[component] = False
 
     # B0 is intentionally a small hand-auditable reference artifact. Its checked-in
-    # file is the canonical source. B1-B4 are compiled from the selective template.
-    source = _baseline_source() if profile_name == "b0" else _render_template(profile)
+    # file is the canonical source. B1-B4 remain on the original selective template
+    # so their benchmark provenance stays byte-stable. B5 uses a separate hardened
+    # retrieval template.
+    if profile_name == "b0":
+        source = _baseline_source()
+    elif profile_name == "b5":
+        source = _render_template(profile, template_path=_B5_TEMPLATE)
+    else:
+        source = _render_template(profile)
     _preflight(source)
     data = source.encode("utf-8")
     maximum = _max_agent_bytes()
@@ -233,18 +242,13 @@ def _baseline_source() -> str:
         ) from exc
 
 
-def _render_template(profile: Mapping[str, Any]) -> str:
+def _render_template(profile: Mapping[str, Any], *, template_path: Path | None = None) -> str:
+    source_path = _TEMPLATE if template_path is None else template_path
     try:
-        template = _TEMPLATE.read_text(encoding="utf-8")
+        template = source_path.read_text(encoding="utf-8")
     except OSError as exc:
-        raise ArtifactBuildError(
-            "unable to read artifact template",
-            context={"path": str(_TEMPLATE)},
-        ) from exc
-    source = template.replace(
-        "__PROFILE_JSON__",
-        pprint.pformat(dict(profile), sort_dicts=True, width=120),
-    )
+        raise ArtifactBuildError("unable to read artifact template", context={"path": str(source_path)}) from exc
+    source = template.replace("__PROFILE_JSON__", pprint.pformat(dict(profile), sort_dicts=True, width=120))
     if "__PROFILE_JSON__" in source:
         raise ArtifactBuildError("artifact template substitution failed")
     return source
