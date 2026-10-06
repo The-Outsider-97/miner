@@ -276,7 +276,7 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser("status")
 
     build = commands.add_parser("build")
-    build.add_argument("profile", choices=["b0", "b1", "b2", "b3", "b4", "b5", "b6", "b7", "all"])
+    build.add_argument("profile", choices=["b0", "b1", "b2", "b3", "b4", "b5", "b6", "b7", "b8", "all"])
     build.add_argument("--official-validate", action="store_true")
     build.add_argument(
         "--disable",

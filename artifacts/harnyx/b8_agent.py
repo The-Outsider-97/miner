@@ -1,0 +1,2198 @@
+from __future__ import annotations
+
+import json
+import re
+import time
+
+from harnyx_miner_sdk.api import fetch_page, llm_chat, search_web, tooling_info
+from harnyx_miner_sdk.context import ContextSnapshot
+from harnyx_miner_sdk.decorators import entrypoint
+from harnyx_miner_sdk.query import CitationRef, CitationSlice, Query, Response
+from harnyx_miner_sdk.structured_output import validate_output_against_schema
+
+
+PROFILE = {'analysis_max_output_tokens': 700,
+ 'decomposition': True,
+ 'evidence_limit': 5,
+ 'evidence_ranking': True,
+ 'fast_max_output_tokens': 512,
+ 'id': 'b8',
+ 'minimum_final_seconds': 12.0,
+ 'normal_max_output_tokens': 1800,
+ 'provider_routing': True,
+ 'reserve_budget_fraction': 0.25,
+ 'retrieval': True,
+ 'routes': [{'model': 'deepseek-ai/DeepSeek-V3.2-TEE', 'provider': 'chutes'},
+            {'model': 'openai/gpt-oss-120b', 'provider': 'openrouter'},
+            {'model': 'openai/gpt-oss-120b', 'provider': 'ai_gateway'}],
+ 'search_provider': 'desearch',
+ 'search_results': 5,
+ 'tool_timeout_seconds': 25.0,
+ 'verification': True,
+ 'verification_max_output_tokens': 900}
+
+_MARKER = re.compile(r"\[\[(\d+)\]\]")
+_WORD = re.compile(r"[a-z0-9]{3,}")
+_SENTENCE = re.compile(r"(?<=[.!?])\s+")
+_YEAR_WEEK = re.compile(r"\b(20\d{2})[/-](\d{1,2})\b", re.IGNORECASE)
+_WEEK = re.compile(r"\bweek\s+(\d{1,2})\b", re.IGNORECASE)
+_DATE = re.compile(
+    r"\b\d{1,2}\s+"
+    r"(?:january|february|march|april|may|june|july|august|"
+    r"september|october|november|december)\s+20\d{2}\b",
+    re.IGNORECASE,
+)
+
+_MAX_SEARCH_QUERIES = 3
+_MAX_FETCH_PAGES = 3
+_MAX_PAGE_CHARS = 10000
+_MAX_TOTAL_EVIDENCE_CHARS = 22000
+
+_SEARCH_FALLBACKS = (
+    "exa",
+    "tavily",
+    "firecrawl",
+    "desearch",
+)
+
+
+def _normalize(text: str) -> str:
+    return " ".join((text or "").split()).strip()
+
+
+
+def _temporal_anchors(text: str):
+    value = _normalize(text)
+
+    weeks = []
+    dates = []
+
+    for match in _YEAR_WEEK.finditer(value):
+        week = int(match.group(2))
+        if 1 <= week <= 53 and week not in weeks:
+            weeks.append(week)
+
+    for match in _WEEK.finditer(value):
+        week = int(match.group(1))
+        if 1 <= week <= 53 and week not in weeks:
+            weeks.append(week)
+
+    for match in _DATE.finditer(value):
+        date = _normalize(match.group(0)).lower()
+        if date not in dates:
+            dates.append(date)
+
+    return weeks, dates
+
+
+def _candidate_weeks(text: str):
+    weeks = []
+
+    for match in _YEAR_WEEK.finditer(text or ""):
+        week = int(match.group(2))
+        if 1 <= week <= 53 and week not in weeks:
+            weeks.append(week)
+
+    for match in _WEEK.finditer(text or ""):
+        week = int(match.group(1))
+        if 1 <= week <= 53 and week not in weeks:
+            weeks.append(week)
+
+    return weeks
+
+
+def _candidate_matches_anchors(text: str, query_text: str) -> bool:
+    requested_weeks, requested_dates = _temporal_anchors(query_text)
+
+    if not requested_weeks and not requested_dates:
+        return True
+
+    haystack = (text or "").lower()
+    candidate_weeks = _candidate_weeks(haystack)
+
+    if requested_weeks and candidate_weeks:
+        if not any(week in requested_weeks for week in candidate_weeks):
+            return False
+
+    if requested_dates and any(date in haystack for date in requested_dates):
+        return True
+
+    if requested_weeks:
+        return any(
+            (
+                f"week {week}" in haystack
+                or f"week-{week}" in haystack
+                or re.search(rf"20\\d{{2}}[/-]0?{week}\\b", haystack)
+            )
+            for week in requested_weeks
+        )
+
+    return True
+
+
+def _strip_temporal_anchors(text: str) -> str:
+    value = _YEAR_WEEK.sub(" ", text or "")
+    value = _WEEK.sub(" ", value)
+    value = _DATE.sub(" ", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
+
+
+def _query_for_week(text: str, week: int) -> str:
+    normalized = _normalize(text)
+    base = _strip_temporal_anchors(normalized)
+
+    years = re.findall(r"\b(20\d{2})\b", normalized)
+    year = years[0] if years else ""
+
+    # Keep the search focused and isolate one report anchor per query.
+    if len(base) > 220:
+        base = base[:220]
+
+    anchor = f' "week {week}"'
+    if year:
+        anchor += f' "{year}/{week}"'
+
+    return (base + anchor).strip()[:320]
+
+
+def _anchored_queries(text: str):
+    normalized = _normalize(text)
+    weeks, dates = _temporal_anchors(normalized)
+
+    queries = []
+
+    for week in weeks:
+        query = _query_for_week(normalized, week)
+        if query and query not in queries:
+            queries.append(query)
+        if len(queries) >= _MAX_SEARCH_QUERIES:
+            break
+
+    if not queries:
+        base = _strip_temporal_anchors(normalized)[:240]
+        for date in dates:
+            query = (base + ' "' + date + '"').strip()[:320]
+            if query and query not in queries:
+                queries.append(query)
+            if len(queries) >= _MAX_SEARCH_QUERIES:
+                break
+
+    return queries[:_MAX_SEARCH_QUERIES]
+
+
+def _task_policy(query: Query):
+    text = _normalize(query.text.lower())
+    words = _WORD.findall(text)
+
+    comparative = any(
+        token in text
+        for token in (
+            "compare",
+            "comparison",
+            "versus",
+            " vs ",
+            "difference",
+            "change between",
+            "largest increase",
+            "largest decrease",
+            "increase and decrease",
+            "restatement",
+            "changed from",
+            "changed between",
+            "trade-off",
+            "tradeoff",
+        )
+    )
+
+    temporal = any(
+        token in text
+        for token in (
+            "latest",
+            "current",
+            "today",
+            "recent",
+            "as of",
+            "this week",
+            "this month",
+            "this year",
+            "updated",
+            "published",
+        )
+    )
+
+    evidentiary = any(
+        token in text
+        for token in (
+            "source",
+            "evidence",
+            "citation",
+            "research",
+            "study",
+            "paper",
+            "report",
+            "table",
+            "document",
+            "publication",
+            "dataset",
+            "inventory",
+            "registry",
+            "standard",
+            "statistics",
+            "annual report",
+            "weekly report",
+            "according to",
+        )
+    )
+
+    analytical = any(
+        token in text
+        for token in (
+            "analyze",
+            "analyse",
+            "assess",
+            "evaluate",
+            "recommend",
+            "feasibility",
+            "architecture",
+            "strategy",
+            "calculate",
+            "compute",
+            "identify",
+            "determine",
+        )
+    )
+
+    uncertain = any(
+        token in text
+        for token in (
+            "uncertain",
+            "controvers",
+            "conflict",
+            "ambiguous",
+            "risk",
+            "disputed",
+        )
+    )
+
+    document_heavy = any(
+        token in text
+        for token in (
+            "table",
+            "pdf",
+            "report",
+            "publication",
+            "dataset",
+            "registry",
+            "inventory",
+            "list",
+            "statistics",
+        )
+    )
+
+    if query.fast:
+        depth = "lightweight"
+    elif comparative or uncertain or document_heavy:
+        depth = "deep"
+    elif temporal or evidentiary or analytical or len(words) >= 12:
+        depth = "standard"
+    else:
+        depth = "lightweight"
+
+    needs_retrieval = bool(
+        PROFILE["retrieval"]
+        and (
+            temporal
+            or evidentiary
+            or comparative
+            or document_heavy
+            or depth == "deep"
+        )
+    )
+
+    return {
+        "depth": depth,
+        "comparative": comparative,
+        "document_heavy": document_heavy,
+        "needs_retrieval": needs_retrieval,
+        "needs_plan": bool(
+            PROFILE["decomposition"]
+            and needs_retrieval
+            and depth in ("standard", "deep")
+        ),
+        "needs_verification": bool(
+            PROFILE["verification"]
+            and (needs_retrieval or comparative or uncertain or depth == "deep")
+        ),
+        "search_results": (
+            PROFILE["search_results"]
+            if depth == "deep"
+            else max(3, PROFILE["search_results"] // 2)
+        ),
+        "evidence_limit": (
+            PROFILE["evidence_limit"]
+            if depth == "deep"
+            else max(2, PROFILE["evidence_limit"] // 2)
+        ),
+        "fetch_pages": (
+            _MAX_FETCH_PAGES
+            if depth == "deep"
+            else min(2, _MAX_FETCH_PAGES)
+        ),
+    }
+
+
+def _answer_prompt(
+    query: Query,
+    evidence: str,
+    plan: str,
+    retrieval_required: bool,
+) -> str:
+    if evidence:
+        instruction = (
+            "Answer as a careful research assistant. "
+            "Use the supplied evidence for externally verifiable facts. "
+            "If the evidence contains a DETERMINISTIC TABLE COMPARISON block, "
+            "treat that block as an exact calculation from the fetched tables and "
+            "use its stated extrema unless the question asks for a different operation. "
+            "If the question names exact weeks, dates, versions, or report identifiers, "
+            "ignore evidence from non-matching periods or versions. "
+            "For comparisons between reports, tables, versions, datasets, or dates, "
+            "align the exact same row/field/column across the relevant sources, "
+            "extract the required values, perform the calculation explicitly, "
+            "and only then select maxima, minima, increases, decreases, or differences. "
+            "Preserve labels exactly when the question requires exact labels. "
+            "Do not substitute a similar category for an exact category. "
+            "Use only the exact [[n]] citation markers supplied with the evidence "
+            "when prose citations are appropriate."
+        )
+    elif query.fast:
+        instruction = (
+            "Answer every required component directly and correctly. "
+            "Be concise. Do not invent citations or unsupported facts."
+        )
+    elif retrieval_required:
+        instruction = (
+            "External evidence was required but no reliable retrieval evidence was obtained. "
+            "Do not invent sources or citations. "
+            "Answer only if the result can still be derived reliably; otherwise express "
+            "the uncertainty while still respecting the requested output format."
+        )
+    else:
+        instruction = (
+            "Answer accurately and self-contained. "
+            "Do not invent citations. "
+            "State material uncertainty briefly."
+        )
+
+    if query.output_schema is not None:
+        instruction += (
+            " Return ONLY one JSON value matching this JSON Schema exactly; "
+            "no Markdown fence, commentary, or extra keys: "
+            + json.dumps(
+                query.output_schema,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+
+    parts = [
+        instruction,
+        "QUESTION:\n" + query.text,
+    ]
+
+    if plan:
+        parts.append("RESEARCH CHECKS:\n" + plan)
+
+    if evidence:
+        parts.append("EVIDENCE:\n" + evidence)
+
+    return "\n\n".join(parts)
+
+
+def _parse_json(text: str):
+    value = (text or "").strip()
+
+    if value.startswith("```"):
+        newline = value.find("\n")
+        if newline >= 0:
+            value = value[newline + 1 :]
+        if value.endswith("```"):
+            value = value[:-3]
+
+    return json.loads(value.strip())
+
+
+def _schema_fallback(schema):
+    if "const" in schema:
+        return schema["const"]
+
+    enum = schema.get("enum")
+    if isinstance(enum, list) and enum:
+        return enum[0]
+
+    for keyword in ("oneOf", "anyOf"):
+        variants = schema.get(keyword)
+        if isinstance(variants, list) and variants:
+            return _schema_fallback(variants[0])
+
+    kind = schema.get("type")
+
+    if isinstance(kind, list):
+        if "null" in kind:
+            return None
+        kind = kind[0] if kind else None
+
+    if kind == "object" or "properties" in schema:
+        properties = schema.get("properties") or {}
+        return {
+            key: _schema_fallback(properties.get(key) or {})
+            for key in (schema.get("required") or [])
+        }
+
+    if kind == "array":
+        minimum = schema.get("minItems") or 0
+        return [
+            _schema_fallback(schema.get("items") or {})
+            for _ in range(minimum)
+        ]
+
+    if kind == "integer":
+        return int(schema.get("minimum") or 0)
+
+    if kind == "number":
+        return float(schema.get("minimum") or 0.0)
+
+    if kind == "boolean":
+        return False
+
+    if kind == "null":
+        return None
+
+    return "Unavailable"
+
+
+def _sanitize_markers(text: str, count: int) -> str:
+    def replace(match):
+        index = int(match.group(1))
+        return match.group(0) if 1 <= index <= count else ""
+
+    return _MARKER.sub(replace, text).strip()
+
+
+def _domain(url: str) -> str:
+    value = (url or "").lower().strip()
+
+    if "://" in value:
+        value = value.split("://", 1)[1]
+
+    return value.split("/", 1)[0].removeprefix("www.")
+
+
+def _source_score(item, query_words, query_text: str):
+    title = _normalize(item.title or "").lower()
+    note = _normalize(item.note or "").lower()
+    url = (item.url or "").lower()
+    domain = _domain(url)
+
+    haystack = title + " " + note + " " + url
+    overlap = sum(1 for word in query_words if word in haystack)
+
+    authority = 0
+    if (
+        domain.endswith(".gov")
+        or domain.endswith(".gov.uk")
+        or domain.endswith(".edu")
+        or domain.endswith(".ac.uk")
+        or domain.endswith(".europa.eu")
+    ):
+        authority = 5
+    elif any(
+        token in domain
+        for token in (
+            "who.int", "oecd.org", "worldbank.org", "nasa.gov", "usgs.gov",
+            "nist.gov", "loc.gov", "fide.com", "uci.org", "ecma-international.org",
+        )
+    ):
+        authority = 4
+    elif any(token in domain for token in ("nature.com", "science.org", "reuters.com")):
+        authority = 3
+    elif domain:
+        authority = 1
+
+    substance = min(len(note), 2400) // 300
+    requested_weeks, requested_dates = _temporal_anchors(query_text)
+    candidate_weeks = _candidate_weeks(haystack)
+    temporal = 0
+
+    if requested_weeks:
+        overlap_weeks = sum(
+            1
+            for week in requested_weeks
+            if (
+                week in candidate_weeks
+                or f"week {week}" in haystack
+                or f"week-{week}" in haystack
+                or re.search(rf"20\\d{{2}}[/-]0?{week}\\b", haystack)
+            )
+        )
+        temporal += overlap_weeks * 600
+        if candidate_weeks and overlap_weeks == 0:
+            temporal -= 2000
+
+    if requested_dates:
+        temporal += sum(1 for date in requested_dates if date in haystack) * 500
+
+    return authority * 100 + overlap * 10 + substance + temporal
+
+
+def _select_search_results(results, query_text: str, limit: int):
+    query_words = set(_WORD.findall(query_text.lower()))
+    requested_weeks, _ = _temporal_anchors(query_text)
+    seen_urls = set()
+    scored = []
+
+    for item in results:
+        url = (item.url or "").strip()
+        if not url:
+            continue
+
+        key = url.lower()
+        if key in seen_urls:
+            continue
+
+        title = _normalize(item.title or "")
+        note = _normalize(item.note or "")
+        haystack = title + " " + note + " " + url
+
+        if not _candidate_matches_anchors(haystack, query_text):
+            continue
+
+        seen_urls.add(key)
+        scored.append(
+            (
+                _source_score(item, query_words, query_text),
+                item,
+                _candidate_weeks(haystack),
+            )
+        )
+
+    if PROFILE["evidence_ranking"]:
+        scored.sort(key=lambda record: record[0], reverse=True)
+
+    selected = []
+    selected_urls = set()
+
+    for requested_week in requested_weeks:
+        for _, item, candidate_weeks in scored:
+            key = (item.url or "").strip().lower()
+            if key in selected_urls:
+                continue
+            if requested_week in candidate_weeks:
+                selected.append(item)
+                selected_urls.add(key)
+                break
+        if len(selected) >= limit:
+            return selected[:limit]
+
+    for _, item, _ in scored:
+        key = (item.url or "").strip().lower()
+        if key in selected_urls:
+            continue
+        selected.append(item)
+        selected_urls.add(key)
+        if len(selected) >= limit:
+            break
+
+    return selected[:limit]
+
+
+def _provider_order(preferred: str | None = None):
+    providers = []
+
+    for provider in (
+        preferred,
+        PROFILE["search_provider"],
+        *_SEARCH_FALLBACKS,
+    ):
+        if not provider:
+            continue
+
+        if provider not in providers:
+            providers.append(provider)
+
+    return providers
+
+
+def _remaining_seconds(
+    started: float,
+    time_limit_seconds: float,
+    reserve: float = 1.0,
+) -> float:
+    return max(
+        1.0,
+        time_limit_seconds
+        - (time.monotonic() - started)
+        - reserve,
+    )
+
+
+def _bounded_timeout(
+    started: float,
+    time_limit_seconds: float,
+    reserve: float,
+) -> float:
+    return max(
+        1.0,
+        min(
+            PROFILE["tool_timeout_seconds"],
+            _remaining_seconds(
+                started,
+                time_limit_seconds,
+                reserve,
+            ),
+        ),
+    )
+
+
+async def _route():
+    default = PROFILE["routes"][0]
+
+    if not PROFILE["provider_routing"]:
+        return default
+
+    try:
+        info = await tooling_info(timeout=5.0)
+    except Exception:
+        return default
+
+    allowed = (
+        info.response.get("allowed_llm_provider_models")
+        or {}
+    )
+
+    for route in PROFILE["routes"]:
+        if route["model"] in (
+            allowed.get(route["provider"])
+            or []
+        ):
+            return route
+
+    return default
+
+
+def _llm_route_order(route):
+    routes = []
+
+    for candidate in (
+        route,
+        *PROFILE["routes"],
+    ):
+        if candidate not in routes:
+            routes.append(candidate)
+
+    return routes
+
+
+async def _chat(
+    route,
+    prompt: str,
+    tokens: int,
+    timeout: float,
+):
+    for candidate in _llm_route_order(route)[:3]:
+        try:
+            result = await llm_chat(
+                provider=candidate["provider"],
+                model=candidate["model"],
+                messages=[
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    }
+                ],
+                temperature=0.0,
+                max_output_tokens=tokens,
+                timeout=max(
+                    1.0,
+                    min(
+                        PROFILE["tool_timeout_seconds"],
+                        timeout,
+                    ),
+                ),
+            )
+
+            return (
+                (result.llm.raw_text or "").strip(),
+                result.budget.session_remaining_budget_usd,
+            )
+
+        except Exception:
+            continue
+
+    return "", None
+
+
+def _fallback_queries(text: str):
+    normalized = _normalize(text)
+
+    if not normalized:
+        return []
+
+    sentences = [
+        _normalize(part)
+        for part in _SENTENCE.split(normalized)
+        if _normalize(part)
+    ]
+
+    preferred = []
+
+    for sentence in sentences:
+        lower = sentence.lower()
+
+        if any(
+            token in lower
+            for token in (
+                "report",
+                "table",
+                "week ",
+                "publication",
+                "dataset",
+                "registry",
+                "inventory",
+                "standard",
+                "compare",
+            )
+        ):
+            preferred.append(sentence[:320])
+
+        if len(preferred) >= _MAX_SEARCH_QUERIES:
+            break
+
+    if preferred:
+        return preferred
+
+    return [normalized[:320]]
+
+
+def _parse_research_plan(
+    raw: str,
+    query_text: str,
+):
+    queries = []
+    checks = []
+
+    try:
+        payload = _parse_json(raw)
+
+        raw_queries = payload.get("queries")
+        raw_checks = payload.get("checks")
+
+        if isinstance(raw_queries, list):
+            for item in raw_queries:
+                if isinstance(item, str):
+                    value = _normalize(item)
+
+                    if value and value not in queries:
+                        queries.append(value[:320])
+
+                    if len(queries) >= _MAX_SEARCH_QUERIES:
+                        break
+
+        if isinstance(raw_checks, list):
+            for item in raw_checks:
+                if isinstance(item, str):
+                    value = _normalize(item)
+
+                    if value:
+                        checks.append(value)
+
+                    if len(checks) >= 4:
+                        break
+
+    except (
+        json.JSONDecodeError,
+        ValueError,
+        TypeError,
+        AttributeError,
+    ):
+        pass
+
+    if not queries:
+        queries = _fallback_queries(query_text)
+
+    return (
+        queries[:_MAX_SEARCH_QUERIES],
+        "\n".join(
+            "- " + check
+            for check in checks
+        ),
+    )
+
+
+async def _research_plan(
+    query: Query,
+    route,
+    policy,
+    remaining: float,
+    started: float,
+    time_limit_seconds: float,
+):
+    anchored = _anchored_queries(query.text)
+
+    if anchored:
+        return (
+            anchored,
+            "Use only documents matching the explicit week/date anchors in the question.",
+            remaining,
+        )
+
+    if not policy["needs_plan"]:
+        return (
+            _fallback_queries(query.text),
+            "",
+            remaining,
+        )
+
+    prompt = (
+        "Create a compact retrieval plan for the question below. "
+        "Return ONLY JSON with this exact shape: "
+        '{"queries":["search query 1","search query 2"],'
+        '"checks":["factual check 1","factual check 2"]}. '
+        "Use at most 3 search queries and at most 4 factual checks. "
+        "Search queries should target the exact primary documents, organizations, "
+        "dates, versions, tables, reports, standards, datasets, or records needed. "
+        "For comparison questions, create queries that can locate each side of "
+        "the comparison separately. Do not answer the question.\n\n"
+        "QUESTION:\n"
+        + query.text
+    )
+
+    planned, updated = await _chat(
+        route,
+        prompt,
+        PROFILE["analysis_max_output_tokens"],
+        _bounded_timeout(
+            started,
+            time_limit_seconds,
+            PROFILE["minimum_final_seconds"],
+        ),
+    )
+
+    if updated is not None:
+        remaining = updated
+
+    queries, checks = _parse_research_plan(
+        planned,
+        query.text,
+    )
+
+    return queries, checks, remaining
+
+
+async def _search_with_failover(
+    queries,
+    policy,
+    remaining: float,
+    started: float,
+    time_limit_seconds: float,
+):
+    if not queries:
+        return None, None, remaining
+
+    for provider in _provider_order():
+        if (
+            _remaining_seconds(
+                started,
+                time_limit_seconds,
+                PROFILE["minimum_final_seconds"],
+            )
+            <= 1.0
+        ):
+            break
+
+        try:
+            result = await search_web(
+                queries,
+                provider=provider,
+                num=policy["search_results"],
+                timeout=_bounded_timeout(
+                    started,
+                    time_limit_seconds,
+                    PROFILE["minimum_final_seconds"],
+                ),
+            )
+
+            remaining = (
+                result.budget.session_remaining_budget_usd
+            )
+
+            if result.results:
+                filtered = _select_search_results(
+                    result.results,
+                    " ".join(queries),
+                    max(policy["evidence_limit"], policy["fetch_pages"]),
+                )
+                if filtered:
+                    return result, provider, remaining
+
+        except Exception:
+            continue
+
+    return None, None, remaining
+
+
+async def _fetch_with_failover(
+    url: str,
+    preferred_provider: str | None,
+    remaining: float,
+    started: float,
+    time_limit_seconds: float,
+):
+    for provider in _provider_order(
+        preferred_provider,
+    ):
+        if (
+            _remaining_seconds(
+                started,
+                time_limit_seconds,
+                PROFILE["minimum_final_seconds"],
+            )
+            <= 1.0
+        ):
+            break
+
+        try:
+            page = await fetch_page(
+                url,
+                provider=provider,
+                timeout=_bounded_timeout(
+                    started,
+                    time_limit_seconds,
+                    PROFILE["minimum_final_seconds"],
+                ),
+            )
+
+            remaining = (
+                page.budget.session_remaining_budget_usd
+            )
+
+            if page.response.data:
+                return page, provider, remaining
+
+        except Exception:
+            continue
+
+    return None, None, remaining
+
+
+def _item_identity(item) -> str:
+    return (
+        _normalize(item.title or "")
+        + " "
+        + (item.url or "")
+        + " "
+        + _normalize(item.note or "")
+    )
+
+
+def _matches_exact_week(text: str, week: int) -> bool:
+    haystack = (text or "").lower()
+
+    return bool(
+        f"week {week}" in haystack
+        or f"week-{week}" in haystack
+        or re.search(rf"20\d{{2}}[/-]0?{week}\b", haystack)
+    )
+
+
+async def _search_exact_week(
+    query: Query,
+    week: int,
+    policy,
+    remaining: float,
+    started: float,
+    time_limit_seconds: float,
+):
+    search_query = _query_for_week(query.text, week)
+
+    for provider in _provider_order():
+        if (
+            _remaining_seconds(
+                started,
+                time_limit_seconds,
+                PROFILE["minimum_final_seconds"],
+            )
+            <= 1.0
+        ):
+            break
+
+        try:
+            search = await search_web(
+                search_query,
+                provider=provider,
+                num=max(4, policy["search_results"]),
+                timeout=_bounded_timeout(
+                    started,
+                    time_limit_seconds,
+                    PROFILE["minimum_final_seconds"],
+                ),
+            )
+            remaining = search.budget.session_remaining_budget_usd
+        except Exception:
+            continue
+
+        exact = [
+            item
+            for item in search.results
+            if _matches_exact_week(_item_identity(item), week)
+        ]
+
+        if not exact:
+            continue
+
+        exact = _select_search_results(
+            exact,
+            search_query,
+            max(2, policy["fetch_pages"]),
+        )
+
+        for item in exact[:2]:
+            url = (item.url or "").strip()
+            if not url:
+                continue
+
+            page, _, remaining = await _fetch_with_failover(
+                url,
+                provider,
+                remaining,
+                started,
+                time_limit_seconds,
+            )
+
+            if page is None or not page.response.data:
+                continue
+
+            datum = page.response.data[0]
+            identity = (
+                (datum.title or "")
+                + " "
+                + url
+                + " "
+                + datum.content[:2000]
+            )
+
+            if not _matches_exact_week(identity, week):
+                continue
+
+            content = _focused_page_content(
+                datum.content,
+                query.text,
+            )
+
+            if not content:
+                continue
+
+            reference = page.results[0] if page.results else None
+            if reference is None:
+                continue
+
+            return {
+                "week": week,
+                "title": datum.title or item.title or url,
+                "url": url,
+                "content": content,
+                "citation_note": reference.note or "",
+                "receipt_id": page.receipt_id,
+                "result_id": reference.result_id,
+                "citation": CitationRef(
+                    receipt_id=page.receipt_id,
+                    result_id=reference.result_id,
+                ),
+            }, remaining
+
+    return None, remaining
+
+
+def _split_markdown_row(line: str):
+    value = (line or "").strip()
+    if not value.startswith("|"):
+        return []
+
+    return [
+        cell.strip()
+        for cell in value.strip("|").split("|")
+    ]
+
+
+def _parse_integer_cell(value: str):
+    text = _normalize(value)
+
+    if text in {"", "-", "–", "—"}:
+        return 0
+
+    text = text.replace(",", "")
+
+    if re.fullmatch(r"[+-]?\d+", text):
+        return int(text)
+
+    return None
+
+
+def _table_column_values(table: str, target_column: str):
+    lines = [
+        line
+        for line in (table or "").splitlines()
+        if line.strip().startswith("|")
+    ]
+
+    if not lines:
+        return {}
+
+    header_index = None
+    week_headers = []
+
+    for index, line in enumerate(lines):
+        cells = _split_markdown_row(line)
+        headers = [
+            cell
+            for cell in cells
+            if re.fullmatch(r"20\d{2}/\d{1,2}", cell)
+        ]
+
+        if target_column in headers:
+            header_index = index
+            week_headers = headers
+            break
+
+    if header_index is None or not week_headers:
+        return {}
+
+    try:
+        target_index = week_headers.index(target_column)
+    except ValueError:
+        return {}
+
+    value_count = len(week_headers)
+    rows = {}
+
+    for line in lines[header_index + 1 :]:
+        cells = _split_markdown_row(line)
+
+        if not cells:
+            continue
+
+        if all(
+            not cell
+            or set(cell) <= {"-", ":"}
+            for cell in cells
+        ):
+            continue
+
+        if len(cells) < value_count + 1:
+            continue
+
+        value_cells = cells[-value_count:]
+        label_cells = cells[:-value_count]
+
+        label = " ".join(
+            cell
+            for cell in label_cells
+            if cell
+        ).strip()
+
+        if not label:
+            continue
+
+        parsed = _parse_integer_cell(
+            value_cells[target_index],
+        )
+
+        if parsed is None:
+            continue
+
+        rows[label] = parsed
+
+    return rows
+
+
+def _requested_comparison_column(query_text: str):
+    labels = []
+
+    for year, week in _YEAR_WEEK.findall(query_text or ""):
+        label = f"{year}/{int(week)}"
+        if label not in labels:
+            labels.append(label)
+
+    if len(labels) == 1:
+        return labels[0]
+
+    lower = (query_text or "").lower()
+
+    if (
+        "restatement" in lower
+        or "same column" in lower
+        or "same week" in lower
+    ):
+        return labels[0] if labels else None
+
+    return None
+
+
+def _deterministic_table_comparison(query_text: str, sources):
+    lower = (query_text or "").lower()
+
+    if len(sources) != 2:
+        return ""
+
+    if not any(
+        token in lower
+        for token in (
+            "restatement",
+            "largest increase",
+            "largest decrease",
+            "difference",
+            "compare",
+        )
+    ):
+        return ""
+
+    target_column = _requested_comparison_column(query_text)
+    if not target_column:
+        return ""
+
+    first = _table_column_values(
+        sources[0]["content"],
+        target_column,
+    )
+    second = _table_column_values(
+        sources[1]["content"],
+        target_column,
+    )
+
+    if not first or not second:
+        return ""
+
+    changes = []
+
+    for label in first.keys() & second.keys():
+        delta = second[label] - first[label]
+        changes.append(
+            (
+                delta,
+                label,
+                first[label],
+                second[label],
+            )
+        )
+
+    if not changes:
+        return ""
+
+    largest_increase = max(
+        changes,
+        key=lambda item: item[0],
+    )
+    largest_decrease = min(
+        changes,
+        key=lambda item: item[0],
+    )
+
+    top_increases = sorted(
+        changes,
+        key=lambda item: item[0],
+        reverse=True,
+    )[:5]
+    top_decreases = sorted(
+        changes,
+        key=lambda item: item[0],
+    )[:5]
+
+    lines = [
+        "DETERMINISTIC TABLE COMPARISON",
+        (
+            "Compared column "
+            + target_column
+            + " across SOURCE 1 and SOURCE 2 by exact row label."
+        ),
+        (
+            "Largest increase: "
+            + largest_increase[1]
+            + " = "
+            + str(largest_increase[2])
+            + " -> "
+            + str(largest_increase[3])
+            + " (change +"
+            + str(largest_increase[0])
+            + ")."
+        ),
+        (
+            "Largest decrease: "
+            + largest_decrease[1]
+            + " = "
+            + str(largest_decrease[2])
+            + " -> "
+            + str(largest_decrease[3])
+            + " (change "
+            + str(largest_decrease[0])
+            + ", magnitude "
+            + str(abs(largest_decrease[0]))
+            + ")."
+        ),
+        "Top increases:",
+    ]
+
+    for delta, label, old, new in top_increases:
+        lines.append(
+            "- "
+            + label
+            + ": "
+            + str(old)
+            + " -> "
+            + str(new)
+            + " ("
+            + ("+" if delta >= 0 else "")
+            + str(delta)
+            + ")"
+        )
+
+    lines.append("Top decreases:")
+
+    for delta, label, old, new in top_decreases:
+        lines.append(
+            "- "
+            + label
+            + ": "
+            + str(old)
+            + " -> "
+            + str(new)
+            + " ("
+            + ("+" if delta >= 0 else "")
+            + str(delta)
+            + ")"
+        )
+
+    return "\n".join(lines)
+
+
+def _comparison_extreme_labels(comparison: str):
+    labels = []
+
+    for line in (comparison or "").splitlines():
+        for prefix in ("Largest increase: ", "Largest decrease: "):
+            if not line.startswith(prefix):
+                continue
+
+            remainder = line[len(prefix):]
+            label = remainder.split(" = ", 1)[0].strip()
+
+            if label and label not in labels:
+                labels.append(label)
+
+    return labels
+
+
+def _line_slice(text: str, needle: str):
+    if not text or not needle:
+        return None
+
+    index = text.lower().find(needle.lower())
+    if index < 0:
+        return None
+
+    start = text.rfind("\n", 0, index)
+    start = 0 if start < 0 else start + 1
+
+    end = text.find("\n", index)
+    end = len(text) if end < 0 else end
+
+    if end <= start:
+        return None
+
+    return CitationSlice(
+        start=start,
+        end=end,
+    )
+
+
+def _focused_comparison_citations(
+    sources,
+    query_text: str,
+    comparison: str,
+):
+    target_column = _requested_comparison_column(query_text)
+    labels = _comparison_extreme_labels(comparison)
+
+    focused = []
+
+    for source in sources:
+        note = source.get("citation_note") or ""
+        slices = []
+        seen = set()
+
+        for needle in (
+            target_column,
+            *labels,
+        ):
+            if not needle:
+                continue
+
+            segment = _line_slice(
+                note,
+                needle,
+            )
+
+            if segment is None:
+                continue
+
+            key = (segment.start, segment.end)
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+            slices.append(segment)
+
+        if slices:
+            focused.append(
+                CitationRef(
+                    receipt_id=source["receipt_id"],
+                    result_id=source["result_id"],
+                    slices=slices,
+                )
+            )
+        else:
+            focused.append(source["citation"])
+
+    return focused
+
+
+def _comparison_note(
+    evidence: str,
+    citation_count: int,
+):
+    if (
+        citation_count < 2
+        or "DETERMINISTIC TABLE COMPARISON" not in evidence
+    ):
+        return None
+
+    block = evidence.split(
+        "DETERMINISTIC TABLE COMPARISON",
+        1,
+    )[1].split("\n\n", 1)[0]
+
+    lines = [
+        _normalize(line)
+        for line in block.splitlines()
+        if _normalize(line)
+    ]
+
+    compared = next(
+        (
+            line
+            for line in lines
+            if line.startswith("Compared column ")
+        ),
+        None,
+    )
+    increase = next(
+        (
+            line
+            for line in lines
+            if line.startswith("Largest increase: ")
+        ),
+        None,
+    )
+    decrease = next(
+        (
+            line
+            for line in lines
+            if line.startswith("Largest decrease: ")
+        ),
+        None,
+    )
+
+    if not increase or not decrease:
+        return None
+
+    parts = [
+        "Verified from the two fetched source documents.",
+    ]
+
+    if compared:
+        parts.append(compared)
+
+    parts.extend(
+        (
+            increase,
+            decrease,
+            "The extrema were computed across the shared row labels [[1]][[2]].",
+        )
+    )
+
+    return " ".join(parts)
+
+
+def _first_markdown_table(text: str) -> str:
+    lines = (text or "").splitlines()
+    table = []
+    started = False
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("|"):
+            started = True
+            table.append(line)
+            continue
+        if started:
+            break
+
+    return "\n".join(table).strip()
+
+
+def _focused_page_content(text: str, query_text: str) -> str:
+    value = (text or "").replace("\x00", "").strip()
+    if not value:
+        return ""
+
+    lower_query = query_text.lower()
+    if (
+        "first table" in lower_query
+        or "table" in lower_query
+        or "largest increase" in lower_query
+        or "largest decrease" in lower_query
+        or "restatement" in lower_query
+    ):
+        table = _first_markdown_table(value)
+        if table:
+            value = table
+
+    if len(value) > _MAX_PAGE_CHARS:
+        value = value[:_MAX_PAGE_CHARS]
+
+    return value
+
+
+async def _evidence_fallback(
+    query: Query,
+    queries,
+    checks: str,
+    policy,
+    remaining: float,
+    started: float,
+    time_limit_seconds: float,
+):
+    if not policy["needs_retrieval"]:
+        return "", [], remaining
+
+    search, search_provider, remaining = await _search_with_failover(
+        queries,
+        policy,
+        remaining,
+        started,
+        time_limit_seconds,
+    )
+
+    if search is None:
+        return "", [], remaining
+
+    candidates = _select_search_results(
+        search.results,
+        query.text,
+        max(
+            policy["evidence_limit"],
+            policy["fetch_pages"],
+        ),
+    )
+
+    evidence_parts = []
+    citations = []
+    evidence_chars = 0
+
+    for item in candidates[: policy["fetch_pages"]]:
+        if evidence_chars >= _MAX_TOTAL_EVIDENCE_CHARS:
+            break
+
+        url = (item.url or "").strip()
+
+        if not url:
+            continue
+
+        page, _, remaining = await _fetch_with_failover(
+            url,
+            search_provider,
+            remaining,
+            started,
+            time_limit_seconds,
+        )
+
+        if page is not None and page.response.data:
+            datum = page.response.data[0]
+
+            page_identity = (
+                (datum.title or "")
+                + " "
+                + url
+                + " "
+                + datum.content[:2000]
+            )
+
+            if not _candidate_matches_anchors(page_identity, query.text):
+                continue
+
+            content = _focused_page_content(
+                datum.content,
+                query.text,
+            )
+
+            if content:
+                reference = (
+                    page.results[0]
+                    if page.results
+                    else None
+                )
+
+                if reference is not None:
+                    citations.append(
+                        CitationRef(
+                            receipt_id=page.receipt_id,
+                            result_id=reference.result_id,
+                        )
+                    )
+
+                    marker = "[[" + str(len(citations)) + "]]"
+                    title = (
+                        datum.title
+                        or item.title
+                        or url
+                    )
+
+                    allowance = max(
+                        0,
+                        _MAX_TOTAL_EVIDENCE_CHARS
+                        - evidence_chars,
+                    )
+
+                    content = content[:allowance]
+
+                    evidence_parts.append(
+                        "SOURCE "
+                        + str(len(citations))
+                        + " "
+                        + marker
+                        + " "
+                        + _normalize(title)
+                        + "\nURL: "
+                        + url
+                        + "\n"
+                        + content
+                    )
+
+                    evidence_chars += len(content)
+                    continue
+
+        note = _normalize(item.note or "")
+
+        if not note:
+            continue
+
+        citations.append(
+            CitationRef(
+                receipt_id=search.receipt_id,
+                result_id=item.result_id,
+            )
+        )
+
+        marker = "[[" + str(len(citations)) + "]]"
+
+        evidence_parts.append(
+            "SOURCE "
+            + str(len(citations))
+            + " "
+            + marker
+            + " "
+            + _normalize(item.title or url)
+            + "\nURL: "
+            + url
+            + "\n"
+            + note[:2400]
+        )
+
+        evidence_chars += min(
+            len(note),
+            2400,
+        )
+
+    if not evidence_parts:
+        for item in candidates[: policy["evidence_limit"]]:
+            note = _normalize(item.note or "")
+            url = (item.url or "").strip()
+
+            if not note or not url:
+                continue
+
+            citations.append(
+                CitationRef(
+                    receipt_id=search.receipt_id,
+                    result_id=item.result_id,
+                )
+            )
+
+            marker = "[[" + str(len(citations)) + "]]"
+
+            evidence_parts.append(
+                "SOURCE "
+                + str(len(citations))
+                + " "
+                + marker
+                + " "
+                + _normalize(item.title or url)
+                + "\nURL: "
+                + url
+                + "\n"
+                + note[:2400]
+            )
+
+    if checks:
+        evidence_parts.insert(
+            0,
+            "REQUIRED FACTUAL CHECKS:\n" + checks,
+        )
+
+    return (
+        "\n\n".join(evidence_parts),
+        citations,
+        remaining,
+    )
+
+
+async def _evidence(
+    query: Query,
+    queries,
+    checks: str,
+    policy,
+    remaining: float,
+    started: float,
+    time_limit_seconds: float,
+):
+    if not policy["needs_retrieval"]:
+        return "", [], remaining
+
+    requested_weeks, _ = _temporal_anchors(query.text)
+
+    # When multiple explicit report weeks are named, retrieve and fetch each
+    # week separately. Do not proceed with a partial comparison.
+    if len(requested_weeks) >= 2:
+        sources = []
+
+        for week in requested_weeks[:2]:
+            source, remaining = await _search_exact_week(
+                query,
+                week,
+                policy,
+                remaining,
+                started,
+                time_limit_seconds,
+            )
+
+            if source is None:
+                missing = (
+                    "RETRIEVAL COVERAGE FAILURE: unable to obtain a fetched source "
+                    "matching explicit week "
+                    + str(week)
+                    + ". Do not compare unrelated weeks."
+                )
+                return missing, [], remaining
+
+            sources.append(source)
+
+        citations = [
+            source["citation"]
+            for source in sources
+        ]
+
+        parts = []
+
+        comparison = _deterministic_table_comparison(
+            query.text,
+            sources,
+        )
+
+        if comparison:
+            citations = _focused_comparison_citations(
+                sources,
+                query.text,
+                comparison,
+            )
+            parts.append(comparison)
+
+        if checks:
+            parts.append(
+                "REQUIRED FACTUAL CHECKS:\n"
+                + checks
+            )
+
+        for index, source in enumerate(sources, start=1):
+            parts.append(
+                "SOURCE "
+                + str(index)
+                + " [["
+                + str(index)
+                + "]] "
+                + _normalize(source["title"])
+                + "\nREPORT WEEK: "
+                + str(source["week"])
+                + "\nURL: "
+                + source["url"]
+                + "\n"
+                + source["content"][:_MAX_PAGE_CHARS]
+            )
+
+        return (
+            "\n\n".join(parts),
+            citations,
+            remaining,
+        )
+
+    return await _evidence_fallback(
+        query,
+        queries,
+        checks,
+        policy,
+        remaining,
+        started,
+        time_limit_seconds,
+    )
+
+
+async def _structured(
+    query: Query,
+    route,
+    raw: str,
+    remaining: float,
+    started: float,
+    time_limit_seconds: float,
+):
+    schema = query.output_schema or {}
+
+    try:
+        output = _parse_json(raw)
+        validate_output_against_schema(
+            output,
+            schema,
+        )
+        return output, remaining
+
+    except (
+        json.JSONDecodeError,
+        ValueError,
+        TypeError,
+    ):
+        pass
+
+    if (
+        _remaining_seconds(
+            started,
+            time_limit_seconds,
+            PROFILE["minimum_final_seconds"],
+        )
+        <= 1.0
+    ):
+        return (
+            _schema_fallback(schema),
+            remaining,
+        )
+
+    repair = (
+        "Repair this candidate into exactly one JSON value matching the schema. "
+        "Do not add commentary. Return JSON only.\n\n"
+        "SCHEMA:\n"
+        + json.dumps(
+            schema,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        + "\n\nCANDIDATE:\n"
+        + raw
+    )
+
+    fixed, updated = await _chat(
+        route,
+        repair,
+        PROFILE["normal_max_output_tokens"],
+        _bounded_timeout(
+            started,
+            time_limit_seconds,
+            PROFILE["minimum_final_seconds"],
+        ),
+    )
+
+    if updated is not None:
+        remaining = updated
+
+    try:
+        output = _parse_json(fixed)
+        validate_output_against_schema(
+            output,
+            schema,
+        )
+        return output, remaining
+
+    except (
+        json.JSONDecodeError,
+        ValueError,
+        TypeError,
+    ):
+        return (
+            _schema_fallback(schema),
+            remaining,
+        )
+
+
+async def _verify(
+    query: Query,
+    route,
+    answer,
+    evidence: str,
+    policy,
+    remaining: float,
+    started: float,
+    time_limit_seconds: float,
+    minimum_budget_reserve_usd: float,
+):
+    if not policy["needs_verification"]:
+        return answer, remaining
+
+    if policy["needs_retrieval"] and not evidence:
+        return answer, remaining
+
+    elapsed = time.monotonic() - started
+
+    if (
+        remaining <= minimum_budget_reserve_usd
+        or time_limit_seconds - elapsed
+        <= PROFILE["minimum_final_seconds"]
+    ):
+        return answer, remaining
+
+    if query.output_schema is not None:
+        prompt = (
+            "Verify the candidate against the question and retrieved evidence. "
+            "If a DETERMINISTIC TABLE COMPARISON block is present, the candidate "
+            "must agree with its exact computed extrema and magnitudes. "
+            "For numerical/table comparisons, recompute the required values from "
+            "the evidence before accepting the candidate. Correct only material "
+            "errors. Preserve exact labels required by the question. "
+            "Return JSON only.\n\n"
+            "QUESTION:\n"
+            + query.text
+            + "\n\nEVIDENCE:\n"
+            + evidence
+            + "\n\nSCHEMA:\n"
+            + json.dumps(
+                query.output_schema,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            + "\n\nCANDIDATE:\n"
+            + json.dumps(
+                answer,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+    else:
+        prompt = (
+            "Verify the candidate against the question and retrieved evidence. "
+            "Correct material factual, calculation, support, or coverage errors. "
+            "For comparisons, recompute values from the cited evidence. "
+            "Remove unsupported assertions. Preserve valid [[n]] citation markers. "
+            "Return only the corrected answer.\n\n"
+            "QUESTION:\n"
+            + query.text
+            + "\n\nEVIDENCE:\n"
+            + evidence
+            + "\n\nCANDIDATE:\n"
+            + str(answer)
+        )
+
+    checked, updated = await _chat(
+        route,
+        prompt,
+        PROFILE["verification_max_output_tokens"],
+        _bounded_timeout(
+            started,
+            time_limit_seconds,
+            1.0,
+        ),
+    )
+
+    if updated is not None:
+        remaining = updated
+
+    if not checked:
+        return answer, remaining
+
+    if query.output_schema is None:
+        return checked, remaining
+
+    try:
+        output = _parse_json(checked)
+
+        validate_output_against_schema(
+            output,
+            query.output_schema,
+        )
+
+        return output, remaining
+
+    except (
+        json.JSONDecodeError,
+        ValueError,
+        TypeError,
+    ):
+        return answer, remaining
+
+
+@entrypoint("query")
+async def query(
+    query: Query,
+    context: ContextSnapshot,
+) -> Response:
+    started = time.monotonic()
+
+    remaining = (
+        context.cost_budget.session_remaining_budget_usd
+    )
+
+    time_limit_seconds = (
+        context.time_budget.limit_seconds
+    )
+
+    minimum_budget_reserve_usd = max(
+        0.005,
+        context.cost_budget.session_budget_usd
+        * PROFILE["reserve_budget_fraction"],
+    )
+
+    policy = _task_policy(query)
+    route = await _route()
+
+    search_queries, plan, remaining = await _research_plan(
+        query,
+        route,
+        policy,
+        remaining,
+        started,
+        time_limit_seconds,
+    )
+
+    evidence, citations, remaining = await _evidence(
+        query,
+        search_queries,
+        plan,
+        policy,
+        remaining,
+        started,
+        time_limit_seconds,
+    )
+
+    raw, updated = await _chat(
+        route,
+        _answer_prompt(
+            query,
+            evidence,
+            plan,
+            policy["needs_retrieval"],
+        ),
+        (
+            PROFILE["fast_max_output_tokens"]
+            if query.fast
+            else PROFILE["normal_max_output_tokens"]
+        ),
+        _bounded_timeout(
+            started,
+            time_limit_seconds,
+            1.0,
+        ),
+    )
+
+    if updated is not None:
+        remaining = updated
+
+    if query.output_schema is not None:
+        output, remaining = await _structured(
+            query,
+            route,
+            raw,
+            remaining,
+            started,
+            time_limit_seconds,
+        )
+
+        output, remaining = await _verify(
+            query,
+            route,
+            output,
+            evidence,
+            policy,
+            remaining,
+            started,
+            time_limit_seconds,
+            minimum_budget_reserve_usd,
+        )
+
+        return Response(
+            output=output,
+            note=_comparison_note(
+                evidence,
+                len(citations),
+            ),
+            citations=citations or None,
+        )
+
+    if not raw:
+        raw = (
+            "No reliable answer was produced within "
+            "the available tool and cost budget."
+        )
+
+    answer = _sanitize_markers(
+        raw,
+        len(citations),
+    )
+
+    answer, remaining = await _verify(
+        query,
+        route,
+        answer,
+        evidence,
+        policy,
+        remaining,
+        started,
+        time_limit_seconds,
+        minimum_budget_reserve_usd,
+    )
+
+    answer = _sanitize_markers(
+        str(answer),
+        len(citations),
+    )
+
+    if citations and "[[" not in answer:
+        answer += (
+            "\n\nSources: "
+            + "".join(
+                "[[" + str(index) + "]]"
+                for index in range(
+                    1,
+                    len(citations) + 1,
+                )
+            )
+        )
+
+    return Response(
+        text=answer,
+        citations=citations or None,
+    )

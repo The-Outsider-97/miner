@@ -136,6 +136,13 @@ artifact:
       retrieval: true
       evidence_ranking: true
       verification: true
+    b8:
+      description: Complete-anchor comparison profile with separate retrieval per explicit report week, mandatory source coverage, deterministic shared-column table differencing, focused evidence, and evidence-gated verification.
+      provider_routing: true
+      decomposition: true
+      retrieval: true
+      evidence_ranking: true
+      verification: true
 
 slai:
   # These are the only current Miner hot-path experiment candidates exposed by

@@ -120,3 +120,24 @@ def test_b7_requires_complete_anchor_coverage_and_table_diff(tmp_path: Path):
     assert result.size_bytes <= _max_agent_bytes()
 
     compile(text, str(result.path), "exec")
+
+
+def test_b8_adds_focused_citations_and_public_verification_note(tmp_path: Path):
+    result = build_artifact(
+        "b8",
+        output_path=tmp_path / "b8_agent.py",
+        manifest_root=tmp_path / "manifests",
+    )
+    text = result.path.read_text(encoding="utf-8")
+
+    assert "CitationSlice" in text
+    assert "_focused_comparison_citations" in text
+    assert "_comparison_extreme_labels" in text
+    assert "_comparison_note" in text
+    assert "Verified from the two fetched source documents." in text
+    assert "note=_comparison_note(" in text
+    assert "'retrieval': True" in text
+    assert "'verification': True" in text
+    assert result.size_bytes <= _max_agent_bytes()
+
+    compile(text, str(result.path), "exec")

@@ -24,6 +24,7 @@ _TEMPLATE = _ARTIFACT_ROOT / "_agent_template.py.tmpl"
 _B5_TEMPLATE = _ARTIFACT_ROOT / "_agent_b5_template.py.tmpl"
 _B6_TEMPLATE = _ARTIFACT_ROOT / "_agent_b6_template.py.tmpl"
 _B7_TEMPLATE = _ARTIFACT_ROOT / "_agent_b7_template.py.tmpl"
+_B8_TEMPLATE = _ARTIFACT_ROOT / "_agent_b8_template.py.tmpl"
 _BASELINE = _ARTIFACT_ROOT / "baseline_agent.py"
 _MANIFEST_ROOT = PROJECT_ROOT / "benchmarks" / "harnyx" / "manifests"
 _FILENAMES = {
@@ -35,6 +36,7 @@ _FILENAMES = {
     "b5": "b5_agent.py",
     "b6": "b6_agent.py",
     "b7": "b7_agent.py",
+    "b8": "b8_agent.py",
 }
 _ABLATIONS = {
     "provider_routing",
@@ -142,6 +144,8 @@ def build_artifact(
         source = _render_template(profile, template_path=_B6_TEMPLATE)
     elif profile_name == "b7":
         source = _render_template(profile, template_path=_B7_TEMPLATE)
+    elif profile_name == "b8":
+        source = _render_template(profile, template_path=_B8_TEMPLATE)
     else:
         source = _render_template(profile)
     _preflight(source)
