@@ -75,3 +75,48 @@ def test_b5_uses_hardened_retrieval_template(tmp_path: Path):
     assert result.size_bytes <= _max_agent_bytes()
 
     compile(text, str(result.path), "exec")
+
+
+def test_b6_uses_exact_anchor_retrieval_template(tmp_path: Path):
+    result = build_artifact(
+        "b6",
+        output_path=tmp_path / "b6_agent.py",
+        manifest_root=tmp_path / "manifests",
+    )
+    text = result.path.read_text(encoding="utf-8")
+
+    assert "_temporal_anchors" in text
+    assert "_candidate_matches_anchors" in text
+    assert "_anchored_queries" in text
+    assert "_focused_page_content" in text
+    assert "_first_markdown_table" in text
+    assert "fetch_page" in text
+    assert "search_web" in text
+    assert "'retrieval': True" in text
+    assert "'verification': True" in text
+    assert result.size_bytes <= _max_agent_bytes()
+
+    compile(text, str(result.path), "exec")
+
+
+def test_b7_requires_complete_anchor_coverage_and_table_diff(tmp_path: Path):
+    result = build_artifact(
+        "b7",
+        output_path=tmp_path / "b7_agent.py",
+        manifest_root=tmp_path / "manifests",
+    )
+    text = result.path.read_text(encoding="utf-8")
+
+    assert "_search_exact_week" in text
+    assert "_matches_exact_week" in text
+    assert "_table_column_values" in text
+    assert "_deterministic_table_comparison" in text
+    assert "RETRIEVAL COVERAGE FAILURE" in text
+    assert "DETERMINISTIC TABLE COMPARISON" in text
+    assert "fetch_page" in text
+    assert "search_web" in text
+    assert "'retrieval': True" in text
+    assert "'verification': True" in text
+    assert result.size_bytes <= _max_agent_bytes()
+
+    compile(text, str(result.path), "exec")

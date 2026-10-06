@@ -22,6 +22,8 @@ from .utils.miner_helpers import PROJECT_ROOT, git_head, require_external_reposi
 _ARTIFACT_ROOT = PROJECT_ROOT / "artifacts" / "harnyx"
 _TEMPLATE = _ARTIFACT_ROOT / "_agent_template.py.tmpl"
 _B5_TEMPLATE = _ARTIFACT_ROOT / "_agent_b5_template.py.tmpl"
+_B6_TEMPLATE = _ARTIFACT_ROOT / "_agent_b6_template.py.tmpl"
+_B7_TEMPLATE = _ARTIFACT_ROOT / "_agent_b7_template.py.tmpl"
 _BASELINE = _ARTIFACT_ROOT / "baseline_agent.py"
 _MANIFEST_ROOT = PROJECT_ROOT / "benchmarks" / "harnyx" / "manifests"
 _FILENAMES = {
@@ -31,6 +33,8 @@ _FILENAMES = {
     "b3": "b3_agent.py",
     "b4": "b4_agent.py",
     "b5": "b5_agent.py",
+    "b6": "b6_agent.py",
+    "b7": "b7_agent.py",
 }
 _ABLATIONS = {
     "provider_routing",
@@ -134,6 +138,10 @@ def build_artifact(
         source = _baseline_source()
     elif profile_name == "b5":
         source = _render_template(profile, template_path=_B5_TEMPLATE)
+    elif profile_name == "b6":
+        source = _render_template(profile, template_path=_B6_TEMPLATE)
+    elif profile_name == "b7":
+        source = _render_template(profile, template_path=_B7_TEMPLATE)
     else:
         source = _render_template(profile)
     _preflight(source)
