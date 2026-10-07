@@ -167,7 +167,7 @@ def test_healthy_slai_without_runtime_use_does_not_degrade_backend(
     monkeypatch.setattr(
         dashboard_api,
         "dependency_status",
-        lambda config: _dependency_state(slai_clean=False),
+        lambda config: _dependency_state(slai_clean=True),
     )
 
     snapshot = build_dashboard_snapshot(database_path=tmp_path / "missing.sqlite3")
@@ -175,11 +175,35 @@ def test_healthy_slai_without_runtime_use_does_not_degrade_backend(
     assert snapshot["backend"]["status"] == "ready"
     assert snapshot["slai"]["status"] == "ready"
     assert snapshot["slai"]["revision_state"] == "matching"
-    assert snapshot["slai"]["worktree_state"] == "modified"
-    assert snapshot["slai"]["pinned"] is False
+    assert snapshot["slai"]["worktree_state"] == "clean"
+    assert snapshot["slai"]["pinned"] is True
     assert snapshot["slai"]["runtime_evidence"] == "not_recorded"
     assert snapshot["slai"]["selected_agents"] == []
     assert snapshot["slai"]["runtime_measurements"] == []
+
+
+
+
+
+def test_modified_slai_worktree_is_distinct_from_revision_mismatch(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    state = _dependency_state(slai_clean=False)
+    state["slai"]["status"] = "degraded"
+    monkeypatch.setattr(
+        dashboard_api,
+        "dependency_status",
+        lambda config: state,
+    )
+
+    snapshot = build_dashboard_snapshot(database_path=tmp_path / "missing.sqlite3")
+
+    assert snapshot["backend"]["status"] == "degraded"
+    assert snapshot["slai"]["status"] == "degraded"
+    assert snapshot["slai"]["revision_state"] == "matching"
+    assert snapshot["slai"]["worktree_state"] == "modified"
+    assert snapshot["slai"]["runtime_evidence"] == "not_recorded"
 
 
 def test_real_slai_revision_mismatch_degrades_backend(
