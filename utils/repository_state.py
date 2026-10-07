@@ -81,8 +81,19 @@ def dependency_status(config: Mapping[str, Any] | None = None) -> dict[str, dict
 
         revision_state = _revision_state(expected, actual)
         revision_matches = revision_state == "matching"
+
+        # SLAI integration health is based on dependency availability and the
+        # configured revision. Its worktree may contain unrelated development
+        # changes (for example scraper files that are not part of the miner
+        # runtime), so cleanliness remains a separate reproducibility signal.
+        #
+        # Harnyx is production/vendor code and remains strict: tracked worktree
+        # modifications keep it degraded even when its configured revision
+        # matches.
+        integration_ready = revision_matches and (clean or name == "slai")
+
         result[name] = {
-            "status": "ready" if revision_matches and clean else "degraded",
+            "status": "ready" if integration_ready else "degraded",
             "path": str(root.relative_to(PROJECT_ROOT)),
             "expected_commit": expected,
             "actual_commit": actual,

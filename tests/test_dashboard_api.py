@@ -182,12 +182,12 @@ def test_healthy_slai_without_runtime_use_does_not_degrade_backend(
     assert snapshot["slai"]["runtime_measurements"] == []
 
 
-def test_modified_slai_worktree_is_distinct_from_revision_mismatch(
+def test_modified_slai_worktree_does_not_poison_integration_health(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
     state = _dependency_state(slai_clean=False)
-    state["slai"]["status"] = "degraded"
+    state["slai"]["status"] = "ready"
     monkeypatch.setattr(
         dashboard_api,
         "dependency_status",
@@ -196,10 +196,11 @@ def test_modified_slai_worktree_is_distinct_from_revision_mismatch(
 
     snapshot = build_dashboard_snapshot(database_path=tmp_path / "missing.sqlite3")
 
-    assert snapshot["backend"]["status"] == "degraded"
-    assert snapshot["slai"]["status"] == "degraded"
+    assert snapshot["backend"]["status"] == "ready"
+    assert snapshot["slai"]["status"] == "ready"
     assert snapshot["slai"]["revision_state"] == "matching"
     assert snapshot["slai"]["worktree_state"] == "modified"
+    assert snapshot["slai"]["pinned"] is False
     assert snapshot["slai"]["runtime_evidence"] == "not_recorded"
 
 
