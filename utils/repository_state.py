@@ -82,14 +82,11 @@ def dependency_status(config: Mapping[str, Any] | None = None) -> dict[str, dict
         revision_state = _revision_state(expected, actual)
         revision_matches = revision_state == "matching"
 
-        # Integration health answers whether the configured dependency exists at
-        # the expected revision. A dirty worktree is a separate reproducibility
-        # signal: it remains visible and prevents the strict "pinned" claim, but
-        # it does not imply that the dependency cannot be located or integrated.
-        if revision_state == "matching":
-            status = "ready"
-        else:
-            status = "degraded"
+        # A matching commit is necessary but not sufficient for strict
+        # dependency health: tracked worktree changes can alter the code that is
+        # actually imported. Keep that reproducibility failure degraded, while
+        # reporting it separately from a genuine revision mismatch.
+        status = "ready" if revision_matches and clean else "degraded"
 
         result[name] = {
             "status": status,
