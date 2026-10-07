@@ -89,9 +89,6 @@ def test_matching_revision_with_modified_worktree_remains_degraded(
     assert status["slai"]["pinned"] is False
 
 
-
-
-
 def test_matching_clean_revision_is_ready(
     monkeypatch,
     tmp_path: Path,
