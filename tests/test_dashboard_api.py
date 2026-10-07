@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from miner.benchmark_store import BenchmarkStore
 import miner.dashboard_api as dashboard_api
+from miner.benchmark_store import BenchmarkStore
 from miner.dashboard_api import _benchmark_snapshot, build_dashboard_snapshot
 
 
@@ -180,9 +180,6 @@ def test_healthy_slai_without_runtime_use_does_not_degrade_backend(
     assert snapshot["slai"]["runtime_evidence"] == "not_recorded"
     assert snapshot["slai"]["selected_agents"] == []
     assert snapshot["slai"]["runtime_measurements"] == []
-
-
-
 
 
 def test_modified_slai_worktree_is_distinct_from_revision_mismatch(
