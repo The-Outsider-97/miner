@@ -132,9 +132,12 @@ def test_b8_adds_focused_citations_and_public_verification_note(tmp_path: Path):
 
     assert "CitationSlice" in text
     assert "_focused_comparison_citations" in text
-    assert "_comparison_extreme_labels" in text
+    assert "_comparison_extrema" in text
+    assert "_context_slice" in text
+    assert "_deterministic_output_from_evidence" in text
     assert "_comparison_note" in text
-    assert "Verified from the two fetched source documents." in text
+    assert "_MIN_CITATION_SLICE_CHARS = 100" in text
+    assert "if deterministic_output is not None:" in text
     assert "note=_comparison_note(" in text
     assert "'retrieval': True" in text
     assert "'verification': True" in text

@@ -30,6 +30,12 @@ _MAX_FETCH_PAGES = 3
 _MAX_PAGE_CHARS = 10000
 _MAX_TOTAL_EVIDENCE_CHARS = 22000
 
+# Harnyx validator contract: any explicit citation slice must contain at least
+# 100 characters unless the complete source text itself is shorter.
+_MIN_CITATION_SLICE_CHARS = 100
+_TARGET_CITATION_SLICE_CHARS = 260
+_MAX_COMPARISON_CITATION_SLICES = 6
+
 _SEARCH_FALLBACKS = (
     "exa",
     "tavily",
@@ -43,6 +49,26 @@ def _normalize(text: str) -> str:
 
 
 
+def _extract_years(text: str):
+    years = []
+
+    for match in re.finditer(r"\b20\d{2}\b", text or ""):
+        year = match.group(0)
+
+        if year not in years:
+            years.append(year)
+
+    return years
+
+
+def _normalize_anchor_text(text: str) -> str:
+    return re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        (text or "").lower(),
+    ).strip()
+
+
 def _temporal_anchors(text: str):
     value = _normalize(text)
 
@@ -51,16 +77,19 @@ def _temporal_anchors(text: str):
 
     for match in _YEAR_WEEK.finditer(value):
         week = int(match.group(2))
+
         if 1 <= week <= 53 and week not in weeks:
             weeks.append(week)
 
     for match in _WEEK.finditer(value):
         week = int(match.group(1))
+
         if 1 <= week <= 53 and week not in weeks:
             weeks.append(week)
 
     for match in _DATE.finditer(value):
         date = _normalize(match.group(0)).lower()
+
         if date not in dates:
             dates.append(date)
 
@@ -72,44 +101,163 @@ def _candidate_weeks(text: str):
 
     for match in _YEAR_WEEK.finditer(text or ""):
         week = int(match.group(2))
+
         if 1 <= week <= 53 and week not in weeks:
             weeks.append(week)
 
     for match in _WEEK.finditer(text or ""):
         week = int(match.group(1))
+
         if 1 <= week <= 53 and week not in weeks:
             weeks.append(week)
 
     return weeks
 
 
-def _candidate_matches_anchors(text: str, query_text: str) -> bool:
-    requested_weeks, requested_dates = _temporal_anchors(query_text)
+def _span_distance(left, right) -> int:
+    if left.end() <= right.start():
+        return right.start() - left.end()
 
-    if not requested_weeks and not requested_dates:
-        return True
+    if right.end() <= left.start():
+        return left.start() - right.end()
 
-    haystack = (text or "").lower()
-    candidate_weeks = _candidate_weeks(haystack)
+    return 0
 
-    if requested_weeks and candidate_weeks:
-        if not any(week in requested_weeks for week in candidate_weeks):
-            return False
 
-    if requested_dates and any(date in haystack for date in requested_dates):
-        return True
+def _report_anchor_for_week(text: str, week: int):
+    value = text or ""
+    dates = list(_DATE.finditer(value))
 
-    if requested_weeks:
-        return any(
+    # Prefer explicit "week N" mentions because a YYYY/N token can also denote
+    # a table column rather than the report being requested.
+    week_matches = list(
+        re.finditer(
+            rf"\bweek\s+0?{week}\b",
+            value,
+            re.IGNORECASE,
+        )
+    )
+
+    if not week_matches:
+        week_matches = [
+            match
+            for match in _YEAR_WEEK.finditer(value)
+            if int(match.group(2)) == week
+        ]
+
+    target_date = None
+
+    if week_matches and dates:
+        ranked = sorted(
             (
-                f"week {week}" in haystack
-                or f"week-{week}" in haystack
-                or re.search(rf"20\\d{{2}}[/-]0?{week}\\b", haystack)
-            )
-            for week in requested_weeks
+                (
+                    _span_distance(week_match, date_match),
+                    date_match.start(),
+                    date_match,
+                )
+                for week_match in week_matches
+                for date_match in dates
+            ),
+            key=lambda item: (item[0], item[1]),
         )
 
-    return True
+        if ranked and ranked[0][0] <= 180:
+            target_date = _normalize(
+                ranked[0][2].group(0),
+            ).lower()
+
+    target_year = None
+
+    if target_date:
+        years = _extract_years(target_date)
+
+        if years:
+            target_year = years[0]
+
+    if target_year is None:
+        explicit_year_weeks = [
+            match.group(1)
+            for match in _YEAR_WEEK.finditer(value)
+            if int(match.group(2)) == week
+        ]
+
+        if explicit_year_weeks:
+            target_year = explicit_year_weeks[0]
+
+    if target_year is None:
+        global_years = _extract_years(value)
+
+        if len(global_years) == 1:
+            target_year = global_years[0]
+
+    return {
+        "week": week,
+        "date": target_date,
+        "year": target_year,
+    }
+
+
+def _candidate_matches_anchors(text: str, query_text: str) -> bool:
+    requested_weeks, requested_dates = _temporal_anchors(
+        query_text,
+    )
+    requested_years = _extract_years(query_text)
+
+    if (
+        not requested_weeks
+        and not requested_dates
+        and not requested_years
+    ):
+        return True
+
+    haystack = text or ""
+    lowered = haystack.lower()
+    normalized = _normalize_anchor_text(haystack)
+
+    candidate_weeks = _candidate_weeks(haystack)
+    candidate_years = _extract_years(haystack)
+
+    if requested_years and candidate_years:
+        if not set(requested_years) & set(candidate_years):
+            return False
+
+    if requested_weeks and candidate_weeks:
+        if not set(requested_weeks) & set(candidate_weeks):
+            return False
+
+    if requested_dates:
+        candidate_dates = [
+            _normalize(match.group(0)).lower()
+            for match in _DATE.finditer(haystack)
+        ]
+
+        if candidate_dates:
+            if not set(requested_dates) & set(candidate_dates):
+                return False
+
+        normalized_dates = {
+            _normalize_anchor_text(date)
+            for date in requested_dates
+        }
+
+        if any(date in normalized for date in normalized_dates):
+            return True
+
+    if requested_weeks:
+        if any(
+            (
+                f"week {week}" in lowered
+                or f"week-{week}" in lowered
+                or re.search(
+                    rf"20\d{{2}}[/-]0?{week}\b",
+                    lowered,
+                )
+            )
+            for week in requested_weeks
+        ):
+            return True
+
+    return not requested_weeks
 
 
 def _strip_temporal_anchors(text: str) -> str:
@@ -117,25 +265,37 @@ def _strip_temporal_anchors(text: str) -> str:
     value = _WEEK.sub(" ", value)
     value = _DATE.sub(" ", value)
     value = re.sub(r"\s+", " ", value).strip()
+
     return value
 
 
 def _query_for_week(text: str, week: int) -> str:
     normalized = _normalize(text)
     base = _strip_temporal_anchors(normalized)
+    anchor = _report_anchor_for_week(normalized, week)
 
-    years = re.findall(r"\b(20\d{2})\b", normalized)
-    year = years[0] if years else ""
+    # Keep the subject/category wording, but reserve enough room for the exact
+    # temporal anchors. This prevents the important year/date from being
+    # truncated out of a long research question.
+    if len(base) > 190:
+        base = base[:190]
 
-    # Keep the search focused and isolate one report anchor per query.
-    if len(base) > 220:
-        base = base[:220]
+    pieces = [
+        base,
+        f'"week {week}"',
+    ]
 
-    anchor = f' "week {week}"'
-    if year:
-        anchor += f' "{year}/{week}"'
+    if anchor["date"]:
+        pieces.append(
+            '"' + anchor["date"] + '"',
+        )
 
-    return (base + anchor).strip()[:320]
+    if anchor["year"]:
+        pieces.append(
+            '"' + anchor["year"] + "/" + str(week) + '"',
+        )
+
+    return _normalize(" ".join(pieces))[:320]
 
 
 def _anchored_queries(text: str):
@@ -145,22 +305,97 @@ def _anchored_queries(text: str):
     queries = []
 
     for week in weeks:
-        query = _query_for_week(normalized, week)
+        query = _query_for_week(
+            normalized,
+            week,
+        )
+
         if query and query not in queries:
             queries.append(query)
+
         if len(queries) >= _MAX_SEARCH_QUERIES:
             break
 
     if not queries:
-        base = _strip_temporal_anchors(normalized)[:240]
+        base = _strip_temporal_anchors(
+            normalized,
+        )[:240]
+
         for date in dates:
-            query = (base + ' "' + date + '"').strip()[:320]
+            query = (
+                base
+                + ' "'
+                + date
+                + '"'
+            ).strip()[:320]
+
             if query and query not in queries:
                 queries.append(query)
+
             if len(queries) >= _MAX_SEARCH_QUERIES:
                 break
 
     return queries[:_MAX_SEARCH_QUERIES]
+
+
+def _matches_exact_week(text: str, week: int) -> bool:
+    haystack = (text or "").lower()
+
+    return bool(
+        re.search(
+            rf"\bweek[\s-]+0?{week}\b",
+            haystack,
+        )
+        or re.search(
+            rf"\b20\d{{2}}[/-]0?{week}\b",
+            haystack,
+        )
+    )
+
+
+def _matches_report_anchor(
+    text: str,
+    query_text: str,
+    week: int,
+) -> bool:
+    if not _matches_exact_week(text, week):
+        return False
+
+    anchor = _report_anchor_for_week(
+        query_text,
+        week,
+    )
+
+    normalized = _normalize_anchor_text(text)
+    candidate_years = _extract_years(text)
+
+    target_year = anchor["year"]
+
+    if target_year:
+        if (
+            candidate_years
+            and target_year not in candidate_years
+        ):
+            return False
+
+        if target_year not in normalized.split():
+            return False
+
+    target_date = anchor["date"]
+
+    if target_date:
+        normalized_date = _normalize_anchor_text(
+            target_date,
+        )
+
+        # Exact report/date targeting is deliberate here. Weekly-report
+        # comparisons must not silently substitute the same week number from
+        # another year (the failure that selected a 2022 report for a 2026
+        # task).
+        if normalized_date not in normalized:
+            return False
+
+    return True
 
 
 def _task_policy(query: Query):
@@ -478,9 +713,14 @@ def _source_score(item, query_words, query_text: str):
     domain = _domain(url)
 
     haystack = title + " " + note + " " + url
-    overlap = sum(1 for word in query_words if word in haystack)
+    overlap = sum(
+        1
+        for word in query_words
+        if word in haystack
+    )
 
     authority = 0
+
     if (
         domain.endswith(".gov")
         or domain.endswith(".gov.uk")
@@ -492,20 +732,51 @@ def _source_score(item, query_words, query_text: str):
     elif any(
         token in domain
         for token in (
-            "who.int", "oecd.org", "worldbank.org", "nasa.gov", "usgs.gov",
-            "nist.gov", "loc.gov", "fide.com", "uci.org", "ecma-international.org",
+            "who.int",
+            "oecd.org",
+            "worldbank.org",
+            "nasa.gov",
+            "usgs.gov",
+            "nist.gov",
+            "loc.gov",
+            "fide.com",
+            "uci.org",
+            "ecma-international.org",
         )
     ):
         authority = 4
-    elif any(token in domain for token in ("nature.com", "science.org", "reuters.com")):
+    elif any(
+        token in domain
+        for token in (
+            "nature.com",
+            "science.org",
+            "reuters.com",
+        )
+    ):
         authority = 3
     elif domain:
         authority = 1
 
-    substance = min(len(note), 2400) // 300
-    requested_weeks, requested_dates = _temporal_anchors(query_text)
+    substance = min(
+        len(note),
+        2400,
+    ) // 300
+
+    requested_weeks, requested_dates = _temporal_anchors(
+        query_text,
+    )
+    requested_years = _extract_years(query_text)
+
     candidate_weeks = _candidate_weeks(haystack)
+    candidate_years = _extract_years(haystack)
+
     temporal = 0
+
+    if requested_years:
+        if set(requested_years) & set(candidate_years):
+            temporal += 1200
+        elif candidate_years:
+            temporal -= 5000
 
     if requested_weeks:
         overlap_weeks = sum(
@@ -515,17 +786,32 @@ def _source_score(item, query_words, query_text: str):
                 week in candidate_weeks
                 or f"week {week}" in haystack
                 or f"week-{week}" in haystack
-                or re.search(rf"20\\d{{2}}[/-]0?{week}\\b", haystack)
+                or re.search(
+                    rf"20\d{{2}}[/-]0?{week}\b",
+                    haystack,
+                )
             )
         )
-        temporal += overlap_weeks * 600
+
+        temporal += overlap_weeks * 700
+
         if candidate_weeks and overlap_weeks == 0:
-            temporal -= 2000
+            temporal -= 2500
 
-    if requested_dates:
-        temporal += sum(1 for date in requested_dates if date in haystack) * 500
+    normalized_haystack = _normalize_anchor_text(
+        haystack,
+    )
 
-    return authority * 100 + overlap * 10 + substance + temporal
+    for date in requested_dates:
+        if _normalize_anchor_text(date) in normalized_haystack:
+            temporal += 1400
+
+    return (
+        authority * 100
+        + overlap * 10
+        + substance
+        + temporal
+    )
 
 
 def _select_search_results(results, query_text: str, limit: int):
@@ -978,16 +1264,6 @@ def _item_identity(item) -> str:
     )
 
 
-def _matches_exact_week(text: str, week: int) -> bool:
-    haystack = (text or "").lower()
-
-    return bool(
-        f"week {week}" in haystack
-        or f"week-{week}" in haystack
-        or re.search(rf"20\d{{2}}[/-]0?{week}\b", haystack)
-    )
-
-
 async def _search_exact_week(
     query: Query,
     week: int,
@@ -995,8 +1271,17 @@ async def _search_exact_week(
     remaining: float,
     started: float,
     time_limit_seconds: float,
+    preferred_domain: str | None = None,
 ):
-    search_query = _query_for_week(query.text, week)
+    search_query = _query_for_week(
+        query.text,
+        week,
+    )
+    query_words = set(
+        _WORD.findall(
+            query.text.lower(),
+        )
+    )
 
     for provider in _provider_order():
         if (
@@ -1013,34 +1298,56 @@ async def _search_exact_week(
             search = await search_web(
                 search_query,
                 provider=provider,
-                num=max(4, policy["search_results"]),
+                num=max(
+                    8,
+                    policy["search_results"],
+                ),
                 timeout=_bounded_timeout(
                     started,
                     time_limit_seconds,
                     PROFILE["minimum_final_seconds"],
                 ),
             )
-            remaining = search.budget.session_remaining_budget_usd
+            remaining = (
+                search.budget.session_remaining_budget_usd
+            )
         except Exception:
             continue
 
         exact = [
             item
             for item in search.results
-            if _matches_exact_week(_item_identity(item), week)
+            if _matches_report_anchor(
+                _item_identity(item),
+                query.text,
+                week,
+            )
         ]
 
         if not exact:
             continue
 
-        exact = _select_search_results(
-            exact,
-            search_query,
-            max(2, policy["fetch_pages"]),
+        exact.sort(
+            key=lambda item: (
+                1
+                if (
+                    preferred_domain
+                    and _domain(item.url or "")
+                    == preferred_domain
+                )
+                else 0,
+                _source_score(
+                    item,
+                    query_words,
+                    query.text,
+                ),
+            ),
+            reverse=True,
         )
 
-        for item in exact[:2]:
+        for item in exact[:3]:
             url = (item.url or "").strip()
+
             if not url:
                 continue
 
@@ -1056,15 +1363,20 @@ async def _search_exact_week(
                 continue
 
             datum = page.response.data[0]
+
             identity = (
                 (datum.title or "")
                 + " "
                 + url
                 + " "
-                + datum.content[:2000]
+                + datum.content[:2500]
             )
 
-            if not _matches_exact_week(identity, week):
+            if not _matches_report_anchor(
+                identity,
+                query.text,
+                week,
+            ):
                 continue
 
             content = _focused_page_content(
@@ -1075,7 +1387,12 @@ async def _search_exact_week(
             if not content:
                 continue
 
-            reference = page.results[0] if page.results else None
+            reference = (
+                page.results[0]
+                if page.results
+                else None
+            )
+
             if reference is None:
                 continue
 
@@ -1083,6 +1400,7 @@ async def _search_exact_week(
                 "week": week,
                 "title": datum.title or item.title or url,
                 "url": url,
+                "domain": _domain(url),
                 "content": content,
                 "citation_note": reference.note or "",
                 "receipt_id": page.receipt_id,
@@ -1199,24 +1517,53 @@ def _table_column_values(table: str, target_column: str):
 
 
 def _requested_comparison_column(query_text: str):
+    normalized = _normalize(query_text)
+
+    sentences = [
+        _normalize(part)
+        for part in _SENTENCE.split(normalized)
+        if _normalize(part)
+    ]
+
+    for sentence in sentences:
+        lower = sentence.lower()
+
+        if not any(
+            token in lower
+            for token in (
+                "column",
+                "restrict attention",
+                "same week",
+                "restatement",
+            )
+        ):
+            continue
+
+        match = _YEAR_WEEK.search(sentence)
+
+        if match is not None:
+            return (
+                match.group(1)
+                + "/"
+                + str(int(match.group(2)))
+            )
+
     labels = []
 
-    for year, week in _YEAR_WEEK.findall(query_text or ""):
-        label = f"{year}/{int(week)}"
+    for year, week in _YEAR_WEEK.findall(
+        normalized,
+    ):
+        label = (
+            year
+            + "/"
+            + str(int(week))
+        )
+
         if label not in labels:
             labels.append(label)
 
     if len(labels) == 1:
         return labels[0]
-
-    lower = (query_text or "").lower()
-
-    if (
-        "restatement" in lower
-        or "same column" in lower
-        or "same week" in lower
-    ):
-        return labels[0] if labels else None
 
     return None
 
@@ -1357,44 +1704,202 @@ def _deterministic_table_comparison(query_text: str, sources):
     return "\n".join(lines)
 
 
-def _comparison_extreme_labels(comparison: str):
-    labels = []
+def _comparison_block(evidence: str):
+    if "DETERMINISTIC TABLE COMPARISON" not in (evidence or ""):
+        return ""
 
-    for line in (comparison or "").splitlines():
-        for prefix in ("Largest increase: ", "Largest decrease: "):
-            if not line.startswith(prefix):
+    return evidence.split(
+        "DETERMINISTIC TABLE COMPARISON",
+        1,
+    )[1].split("\n\n", 1)[0].strip()
+
+
+def _comparison_extrema(comparison: str):
+    result = {}
+
+    patterns = {
+        "increase": re.compile(
+            r"^Largest increase: (?P<label>.+?) = "
+            r"(?P<before>-?\d+) -> (?P<after>-?\d+) "
+            r"\(change \+?(?P<delta>-?\d+)\)\.$"
+        ),
+        "decrease": re.compile(
+            r"^Largest decrease: (?P<label>.+?) = "
+            r"(?P<before>-?\d+) -> (?P<after>-?\d+) "
+            r"\(change (?P<delta>-?\d+), magnitude "
+            r"(?P<magnitude>\d+)\)\.$"
+        ),
+    }
+
+    for raw_line in (comparison or "").splitlines():
+        line = _normalize(raw_line)
+
+        for kind, pattern in patterns.items():
+            match = pattern.match(line)
+
+            if match is None:
                 continue
 
-            remainder = line[len(prefix):]
-            label = remainder.split(" = ", 1)[0].strip()
+            values = match.groupdict()
+            result[kind] = {
+                "label": values["label"],
+                "before": int(values["before"]),
+                "after": int(values["after"]),
+                "delta": int(values["delta"]),
+                "magnitude": (
+                    int(values["magnitude"])
+                    if values.get("magnitude") is not None
+                    else abs(int(values["delta"]))
+                ),
+            }
 
-            if label and label not in labels:
+    return result
+
+
+def _comparison_ranked_rows(comparison: str):
+    sections = {
+        "increase": [],
+        "decrease": [],
+    }
+    current = None
+
+    pattern = re.compile(
+        r"^- (?P<label>.+?): "
+        r"(?P<before>-?\d+) -> (?P<after>-?\d+) "
+        r"\((?P<delta>[+-]?\d+)\)$"
+    )
+
+    for raw_line in (comparison or "").splitlines():
+        line = _normalize(raw_line)
+
+        if line == "Top increases:":
+            current = "increase"
+            continue
+
+        if line == "Top decreases:":
+            current = "decrease"
+            continue
+
+        if current is None:
+            continue
+
+        match = pattern.match(line)
+
+        if match is None:
+            continue
+
+        sections[current].append(
+            {
+                "label": match.group("label"),
+                "before": int(match.group("before")),
+                "after": int(match.group("after")),
+                "delta": int(match.group("delta")),
+            }
+        )
+
+    return sections
+
+
+def _comparison_support_labels(comparison: str):
+    extrema = _comparison_extrema(comparison)
+    ranked = _comparison_ranked_rows(comparison)
+    labels = []
+
+    for kind in ("increase", "decrease"):
+        item = extrema.get(kind)
+
+        if item is not None and item["label"] not in labels:
+            labels.append(item["label"])
+
+        for candidate in ranked[kind][:2]:
+            label = candidate["label"]
+
+            if label not in labels:
                 labels.append(label)
 
     return labels
 
 
-def _line_slice(text: str, needle: str):
+def _context_slice(text: str, needle: str):
     if not text or not needle:
         return None
 
-    index = text.lower().find(needle.lower())
+    lower = text.lower()
+    index = lower.find(needle.lower())
+
     if index < 0:
         return None
 
-    start = text.rfind("\n", 0, index)
-    start = 0 if start < 0 else start + 1
+    source_length = len(text)
 
-    end = text.find("\n", index)
-    end = len(text) if end < 0 else end
+    if source_length <= _MIN_CITATION_SLICE_CHARS:
+        return CitationSlice(
+            start=0,
+            end=source_length,
+        )
 
-    if end <= start:
-        return None
+    line_start = text.rfind("\n", 0, index)
+    line_start = 0 if line_start < 0 else line_start + 1
+
+    line_end = text.find("\n", index)
+    line_end = (
+        source_length
+        if line_end < 0
+        else line_end
+    )
+
+    center = (line_start + line_end) // 2
+    half = _TARGET_CITATION_SLICE_CHARS // 2
+
+    start = max(0, center - half)
+    end = min(
+        source_length,
+        start + _TARGET_CITATION_SLICE_CHARS,
+    )
+
+    if end - start < _TARGET_CITATION_SLICE_CHARS:
+        start = max(
+            0,
+            end - _TARGET_CITATION_SLICE_CHARS,
+        )
+
+    if end - start < _MIN_CITATION_SLICE_CHARS:
+        return CitationSlice(
+            start=0,
+            end=source_length,
+        )
 
     return CitationSlice(
         start=start,
         end=end,
     )
+
+
+def _merge_citation_slices(slices):
+    ordered = sorted(
+        slices,
+        key=lambda item: (item.start, item.end),
+    )
+
+    merged = []
+
+    for item in ordered:
+        if not merged:
+            merged.append(item)
+            continue
+
+        previous = merged[-1]
+
+        if item.start <= previous.end + 24:
+            merged[-1] = CitationSlice(
+                start=previous.start,
+                end=max(previous.end, item.end),
+            )
+            continue
+
+        merged.append(item)
+
+    return merged[:_MAX_COMPARISON_CITATION_SLICES]
 
 
 def _focused_comparison_citations(
@@ -1403,39 +1908,42 @@ def _focused_comparison_citations(
     comparison: str,
 ):
     target_column = _requested_comparison_column(query_text)
-    labels = _comparison_extreme_labels(comparison)
-
+    labels = _comparison_support_labels(comparison)
     focused = []
 
     for source in sources:
         note = source.get("citation_note") or ""
         slices = []
-        seen = set()
 
         for needle in (
+            "Week notification received",
             target_column,
             *labels,
         ):
             if not needle:
                 continue
 
-            segment = _line_slice(
+            segment = _context_slice(
                 note,
                 needle,
             )
 
-            if segment is None:
-                continue
+            if segment is not None:
+                slices.append(segment)
 
-            key = (segment.start, segment.end)
+        slices = _merge_citation_slices(slices)
 
-            if key in seen:
-                continue
-
-            seen.add(key)
-            slices.append(segment)
-
-        if slices:
+        # Never emit an explicit slice that violates the validator's
+        # 100-character minimum. If focused slicing cannot be established
+        # safely, fall back to the already-valid whole-result reference.
+        if (
+            slices
+            and all(
+                segment.end - segment.start
+                >= _MIN_CITATION_SLICE_CHARS
+                for segment in slices
+            )
+        ):
             focused.append(
                 CitationRef(
                     receipt_id=source["receipt_id"],
@@ -1449,69 +1957,164 @@ def _focused_comparison_citations(
     return focused
 
 
-def _comparison_note(
+def _deterministic_output_from_evidence(
+    query: Query,
     evidence: str,
-    citation_count: int,
 ):
+    if query.output_schema is None:
+        return None
+
+    comparison = _comparison_block(evidence)
+
+    if not comparison:
+        return None
+
+    extrema = _comparison_extrema(comparison)
+
     if (
-        citation_count < 2
-        or "DETERMINISTIC TABLE COMPARISON" not in evidence
+        "increase" not in extrema
+        or "decrease" not in extrema
     ):
         return None
 
-    block = evidence.split(
-        "DETERMINISTIC TABLE COMPARISON",
-        1,
-    )[1].split("\n\n", 1)[0]
+    increase = extrema["increase"]
+    decrease = extrema["decrease"]
 
-    lines = [
-        _normalize(line)
-        for line in block.splitlines()
-        if _normalize(line)
-    ]
+    candidate = {
+        "largest_decrease_agent": decrease["label"],
+        "largest_decrease_amount": decrease["magnitude"],
+        "largest_increase_agent": increase["label"],
+        "largest_increase_amount": increase["magnitude"],
+    }
 
-    compared = next(
-        (
-            line
-            for line in lines
-            if line.startswith("Compared column ")
-        ),
-        None,
-    )
-    increase = next(
-        (
-            line
-            for line in lines
-            if line.startswith("Largest increase: ")
-        ),
-        None,
-    )
-    decrease = next(
-        (
-            line
-            for line in lines
-            if line.startswith("Largest decrease: ")
-        ),
-        None,
-    )
-
-    if not increase or not decrease:
+    try:
+        validate_output_against_schema(
+            candidate,
+            query.output_schema,
+        )
+    except (ValueError, TypeError):
         return None
 
+    return candidate
+
+
+def _comparison_note(
+    evidence: str,
+    citation_count: int,
+    query_text: str = "",
+):
+    if citation_count < 2:
+        return None
+
+    comparison = _comparison_block(evidence)
+
+    if not comparison:
+        return None
+
+    extrema = _comparison_extrema(comparison)
+    ranked = _comparison_ranked_rows(comparison)
+
+    if (
+        "increase" not in extrema
+        or "decrease" not in extrema
+    ):
+        return None
+
+    increase = extrema["increase"]
+    decrease = extrema["decrease"]
+
+    column_match = re.search(
+        r"^Compared column (?P<column>\S+) across ",
+        comparison,
+        re.MULTILINE,
+    )
+    target_column = (
+        column_match.group("column")
+        if column_match is not None
+        else "the shared column"
+    )
+
+    weeks, _ = _temporal_anchors(query_text)
+
+    if len(weeks) >= 2:
+        first_source = "Report week " + str(weeks[0])
+        second_source = "Report week " + str(weeks[1])
+    else:
+        first_source = "Source 1"
+        second_source = "Source 2"
+
     parts = [
-        "Verified from the two fetched source documents.",
+        (
+            first_source
+            + ", "
+            + target_column
+            + ": "
+            + increase["label"]
+            + " "
+            + str(increase["before"])
+            + "; "
+            + decrease["label"]
+            + " "
+            + str(decrease["before"])
+            + " [[1]]."
+        ),
+        (
+            second_source
+            + " restatement of "
+            + target_column
+            + ": "
+            + increase["label"]
+            + " "
+            + str(increase["after"])
+            + "; "
+            + decrease["label"]
+            + " "
+            + str(decrease["after"])
+            + " [[2]]."
+        ),
+        (
+            "Therefore the largest increase is "
+            + increase["label"]
+            + " (+"
+            + str(abs(increase["delta"]))
+            + ") and the largest decrease is "
+            + decrease["label"]
+            + " ("
+            + str(abs(decrease["delta"]))
+            + ")."
+        ),
     ]
 
-    if compared:
-        parts.append(compared)
+    increase_rivals = [
+        row
+        for row in ranked["increase"]
+        if row["label"] != increase["label"]
+    ]
+    decrease_rivals = [
+        row
+        for row in ranked["decrease"]
+        if row["label"] != decrease["label"]
+    ]
 
-    parts.extend(
-        (
-            increase,
-            decrease,
-            "The extrema were computed across the shared row labels [[1]][[2]].",
+    if increase_rivals and decrease_rivals:
+        inc = increase_rivals[0]
+        dec = decrease_rivals[0]
+
+        parts.append(
+            "The nearest rivals are "
+            + inc["label"]
+            + " (+"
+            + str(abs(inc["delta"]))
+            + ") and "
+            + dec["label"]
+            + " ("
+            + str(dec["delta"])
+            + "), so both extrema are unique [[1]][[2]]."
         )
-    )
+    else:
+        parts.append(
+            "Both extrema were computed across the complete shared row set [[1]][[2]]."
+        )
 
     return " ".join(parts)
 
@@ -1768,6 +2371,8 @@ async def _evidence(
     if len(requested_weeks) >= 2:
         sources = []
 
+        preferred_domain = None
+
         for week in requested_weeks[:2]:
             source, remaining = await _search_exact_week(
                 query,
@@ -1776,6 +2381,7 @@ async def _evidence(
                 remaining,
                 started,
                 time_limit_seconds,
+                preferred_domain=preferred_domain,
             )
 
             if source is None:
@@ -1788,6 +2394,9 @@ async def _evidence(
                 return missing, [], remaining
 
             sources.append(source)
+
+            if preferred_domain is None:
+                preferred_domain = source.get("domain")
 
         citations = [
             source["citation"]
@@ -2080,6 +2689,22 @@ async def query(
         time_limit_seconds,
     )
 
+    deterministic_output = _deterministic_output_from_evidence(
+        query,
+        evidence,
+    )
+
+    if deterministic_output is not None:
+        return Response(
+            output=deterministic_output,
+            note=_comparison_note(
+                evidence,
+                len(citations),
+                query.text,
+            ),
+            citations=citations or None,
+        )
+
     raw, updated = await _chat(
         route,
         _answer_prompt(
@@ -2130,6 +2755,7 @@ async def query(
             note=_comparison_note(
                 evidence,
                 len(citations),
+                query.text,
             ),
             citations=citations or None,
         )

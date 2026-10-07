@@ -137,7 +137,7 @@ artifact:
       evidence_ranking: true
       verification: true
     b8:
-      description: Complete-anchor comparison profile with separate retrieval per explicit report week, mandatory source coverage, deterministic shared-column table differencing, focused evidence, and evidence-gated verification.
+      description: Consolidated B8 hardening with validator-safe focused citations, deterministic pre-LLM table comparison output, complete anchor coverage, and concise 
       provider_routing: true
       decomposition: true
       retrieval: true
