@@ -59,6 +59,10 @@ _HELPERS = {
     "_comparison_support_labels",
     "_context_slice",
     "_merge_citation_slices",
+    "_query_citation_terms",
+    "_preferred_evidence_needles",
+    "_window_around_index",
+    "_bounded_general_citation_slices",
     "_requested_comparison_column",
     "_deterministic_output_from_evidence",
     "_comparison_note",
@@ -130,6 +134,9 @@ def _load_b8_helpers(source: str):
         "_MIN_CITATION_SLICE_CHARS": 100,
         "_TARGET_CITATION_SLICE_CHARS": 260,
         "_MAX_COMPARISON_CITATION_SLICES": 6,
+        "_MAX_GENERAL_CITATION_CHARS_PER_REF": 7200,
+        "_MAX_GENERAL_CITATION_SLICES": 3,
+        "_GENERAL_CITATION_WINDOW_CHARS": 2200,
         "re": re,
         "validate_output_against_schema": (
             _validate_output_against_schema
@@ -393,4 +400,116 @@ def test_b8_has_deterministic_pre_llm_fast_path(
         in source[
             deterministic:first_chat_after_evidence
         ]
+    )
+
+def test_b8_fast_queries_still_retrieve(tmp_path: Path):
+    source = _build_b8(tmp_path)
+
+    assert (
+        'needs_retrieval = bool(\n'
+        '        PROFILE["retrieval"]\n'
+        '        and bool(text)\n'
+        '    )'
+        in source
+    )
+    assert (
+        '3 if needs_retrieval else 2'
+        in source
+    )
+
+
+def test_b8_general_citation_windows_are_bounded(tmp_path: Path):
+    source = _build_b8(tmp_path)
+    helpers = _load_b8_helpers(source)
+
+    text = (
+        ("irrelevant " * 1200)
+        + "\nThe target research fact is Alpha Observatory 42.\n"
+        + ("tail " * 1600)
+    )
+
+    slices = helpers["_bounded_general_citation_slices"](
+        text,
+        "What is the target research fact for Alpha Observatory?",
+        "The target research fact is Alpha Observatory 42.",
+    )
+
+    assert slices
+    assert len(slices) <= 3
+
+    total = 0
+
+    for segment in slices:
+        assert 0 <= segment.start < segment.end <= len(text)
+        assert segment.end - segment.start >= 100
+        total += segment.end - segment.start
+
+    assert total <= 7200
+    materialized = "".join(
+        text[segment.start:segment.end]
+        for segment in slices
+    )
+    assert "Alpha Observatory 42" in materialized
+
+
+def test_b8_never_emits_unsliced_large_general_citations(tmp_path: Path):
+    source = _build_b8(tmp_path)
+
+    assert "_MAX_MATERIALIZED_CITATION_CHARS = 80000" in source
+    assert "_MAX_GENERAL_CITATION_CHARS_PER_REF = 7200" in source
+    assert "_bounded_citation_ref(" in source
+    assert "citation_chars + selected_chars" in source
+
+
+def test_b8_prefers_configured_chutes_route(tmp_path: Path):
+    source = _build_b8(tmp_path)
+
+    assert (
+        '_LLM_PROVIDER_PREFERENCE = ("chutes", "openrouter", "ai_gateway")'
+        in source
+    )
+    assert "_DEAD_LLM_PROVIDERS = set()" in source
+    assert "def _credential_failure(exc: Exception) -> bool:" in source
+    assert "_DEAD_LLM_PROVIDERS.add(" in source
+
+
+def test_b8_embeds_distilled_slai_research_runtime(tmp_path: Path):
+    source = _build_b8(tmp_path)
+
+    assert "__SLAI_RESEARCH_RUNTIME__" not in source
+    assert "class SLAIResearchRuntime:" in source
+    assert "class EvidenceLedger:" in source
+    assert "class ResearchBudget:" in source
+    assert "class ProviderHealth:" in source
+    assert "def should_continue_research(" in source
+    assert "def verification_decision(" in source
+
+
+def test_b8_query_uses_bounded_iterative_research_loop(tmp_path: Path):
+    source = _build_b8(tmp_path)
+
+    assert "_runtime_research_loop(" in source
+    assert "runtime.begin_round(" in source
+    assert "runtime.should_continue_research()" in source
+    assert "_runtime_targeted_repair(" in source
+    assert "runtime.verification_decision(" in source
+    assert "_DEAD_LLM_PROVIDERS.clear()" in source
+
+
+def test_b8_research_runtime_keeps_deterministic_path_first(tmp_path: Path):
+    source = _build_b8(tmp_path)
+
+    deterministic = source.index(
+        "deterministic_output = "
+        "_deterministic_output_from_evidence("
+    )
+    answer_chat = source.index(
+        "raw, updated = await _chat(",
+        deterministic,
+    )
+
+    assert deterministic < answer_chat
+    assert (
+        "runtime.deterministic_solver_used"
+        in source[deterministic:answer_chat]
     )

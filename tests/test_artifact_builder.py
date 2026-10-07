@@ -144,3 +144,31 @@ def test_b8_adds_focused_citations_and_public_verification_note(tmp_path: Path):
     assert result.size_bytes <= _max_agent_bytes()
 
     compile(text, str(result.path), "exec")
+
+
+def test_b8_injects_distilled_runtime_deterministically(tmp_path: Path):
+    first = build_artifact(
+        "b8",
+        output_path=tmp_path / "b8-one.py",
+        manifest_root=tmp_path / "m1",
+    )
+    second = build_artifact(
+        "b8",
+        output_path=tmp_path / "b8-two.py",
+        manifest_root=tmp_path / "m2",
+    )
+
+    one = first.path.read_text(encoding="utf-8")
+    two = second.path.read_text(encoding="utf-8")
+
+    assert first.sha256 == second.sha256
+    assert one == two
+    assert "__SLAI_RESEARCH_RUNTIME__" not in one
+    assert "class SLAIResearchRuntime:" in one
+    assert "class EvidenceLedger:" in one
+    assert "class ResearchBudget:" in one
+    assert "external.slai" not in one
+    assert "src.agents" not in one
+    assert one.count("async def query(") == 1
+    assert first.size_bytes <= _max_agent_bytes()
+    compile(one, str(first.path), "exec")

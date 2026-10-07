@@ -25,8 +25,13 @@ _B5_TEMPLATE = _ARTIFACT_ROOT / "_agent_b5_template.py.tmpl"
 _B6_TEMPLATE = _ARTIFACT_ROOT / "_agent_b6_template.py.tmpl"
 _B7_TEMPLATE = _ARTIFACT_ROOT / "_agent_b7_template.py.tmpl"
 _B8_TEMPLATE = _ARTIFACT_ROOT / "_agent_b8_template.py.tmpl"
+_SLAI_RESEARCH_RUNTIME_SOURCE = (
+    PROJECT_ROOT / "research" / "slai_research_runtime.py"
+)
 _BASELINE = _ARTIFACT_ROOT / "baseline_agent.py"
 _MANIFEST_ROOT = PROJECT_ROOT / "benchmarks" / "harnyx" / "manifests"
+_ARTIFACT_RUNTIME_BEGIN = "# ARTIFACT_RUNTIME_BEGIN"
+_ARTIFACT_RUNTIME_END = "# ARTIFACT_RUNTIME_END"
 _FILENAMES = {
     "b0": "baseline_agent.py",
     "b1": "b1_agent.py",
@@ -145,7 +150,11 @@ def build_artifact(
     elif profile_name == "b7":
         source = _render_template(profile, template_path=_B7_TEMPLATE)
     elif profile_name == "b8":
-        source = _render_template(profile, template_path=_B8_TEMPLATE)
+        source = _render_template(
+            profile,
+            template_path=_B8_TEMPLATE,
+            runtime_source_path=_SLAI_RESEARCH_RUNTIME_SOURCE,
+        )
     else:
         source = _render_template(profile)
     _preflight(source)
@@ -254,16 +263,96 @@ def _baseline_source() -> str:
         ) from exc
 
 
-def _render_template(profile: Mapping[str, Any], *, template_path: Path | None = None) -> str:
+def _render_template(
+    profile: Mapping[str, Any],
+    *,
+    template_path: Path | None = None,
+    runtime_source_path: Path | None = None,
+) -> str:
     source_path = _TEMPLATE if template_path is None else template_path
     try:
         template = source_path.read_text(encoding="utf-8")
     except OSError as exc:
-        raise ArtifactBuildError("unable to read artifact template", context={"path": str(source_path)}) from exc
-    source = template.replace("__PROFILE_JSON__", pprint.pformat(dict(profile), sort_dicts=True, width=120))
+        raise ArtifactBuildError(
+            "unable to read artifact template",
+            context={"path": str(source_path)},
+        ) from exc
+
+    source = template.replace(
+        "__PROFILE_JSON__",
+        pprint.pformat(
+            dict(profile),
+            sort_dicts=True,
+            width=120,
+        ),
+    )
     if "__PROFILE_JSON__" in source:
         raise ArtifactBuildError("artifact template substitution failed")
+
+    runtime_placeholder = "__SLAI_RESEARCH_RUNTIME__"
+    if runtime_placeholder in source:
+        if runtime_source_path is None:
+            raise ArtifactBuildError(
+                "artifact template requires a distilled SLAI research runtime",
+                context={"path": str(source_path)},
+            )
+        source = source.replace(
+            runtime_placeholder,
+            _artifact_runtime_source(runtime_source_path),
+        )
+    elif runtime_source_path is not None:
+        raise ArtifactBuildError(
+            "runtime source was supplied to a template without a runtime placeholder",
+            context={"path": str(source_path)},
+        )
+
+    if runtime_placeholder in source:
+        raise ArtifactBuildError("SLAI research runtime substitution failed")
+
     return source
+
+
+def _artifact_runtime_source(path: Path) -> str:
+    try:
+        source = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ArtifactBuildError(
+            "unable to read distilled SLAI research runtime",
+            context={"path": str(path)},
+        ) from exc
+
+    if (
+        source.count(_ARTIFACT_RUNTIME_BEGIN) != 1
+        or source.count(_ARTIFACT_RUNTIME_END) != 1
+    ):
+        raise ArtifactBuildError(
+            "distilled SLAI research runtime markers are invalid",
+            context={"path": str(path)},
+        )
+
+    _, body = source.split(_ARTIFACT_RUNTIME_BEGIN, 1)
+    body, _ = body.split(_ARTIFACT_RUNTIME_END, 1)
+    body = body.strip() + "\n"
+
+    try:
+        tree = ast.parse(body, filename=str(path))
+        compile(body, str(path), "exec")
+    except SyntaxError as exc:
+        raise ArtifactBuildError(
+            "distilled SLAI research runtime is not valid Python",
+            context={"path": str(path)},
+        ) from exc
+
+    if any(
+        isinstance(node, (ast.Import, ast.ImportFrom))
+        for node in ast.walk(tree)
+    ):
+        raise ArtifactBuildError(
+            "artifact runtime block must rely only on template-provided imports",
+            context={"path": str(path)},
+        )
+
+    return body
 
 
 def _resolve_output_path(
