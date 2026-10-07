@@ -38,6 +38,15 @@ def repository_commits() -> dict[str, str]:
     }
 
 
+def _revision_state(expected: str, actual: str | None) -> str:
+    """Describe pin resolution without conflating it with worktree cleanliness."""
+    if not actual:
+        return "unavailable"
+    if not expected:
+        return "unresolved"
+    return "matching" if expected == actual else "mismatch"
+
+
 def dependency_status(config: Mapping[str, Any] | None = None) -> dict[str, dict[str, Any]]:
     resolved = dict(config) if config is not None else load_config()
     external = get_config_section("external", config=resolved)
@@ -62,20 +71,25 @@ def dependency_status(config: Mapping[str, Any] | None = None) -> dict[str, dict
                 "expected_commit": expected,
                 "actual_commit": None,
                 "revision_matches": False,
+                "revision_state": "unavailable",
                 "clean": False,
+                "worktree_state": "unavailable",
                 "pinned": False,
                 "detail": str(exc),
             }
             continue
 
-        revision_matches = bool(expected and expected == actual)
+        revision_state = _revision_state(expected, actual)
+        revision_matches = revision_state == "matching"
         result[name] = {
             "status": "ready" if revision_matches and clean else "degraded",
             "path": str(root.relative_to(PROJECT_ROOT)),
             "expected_commit": expected,
             "actual_commit": actual,
             "revision_matches": revision_matches,
+            "revision_state": revision_state,
             "clean": clean,
+            "worktree_state": "clean" if clean else "modified",
             "pinned": revision_matches and clean,
         }
 

@@ -218,6 +218,8 @@ export type DashboardSnapshot = {
     status: StatusState;
     commit: string | null;
     expected_commit: string | null;
+    revision_state: "matching" | "mismatch" | "unresolved" | "unavailable" | string;
+    worktree_state: "clean" | "modified" | "unavailable" | string;
     pinned: boolean;
     selected_agents: string[];
     runtime_measurements: RuntimeMeasurement[];
@@ -228,6 +230,8 @@ export type DashboardSnapshot = {
     status: StatusState;
     commit: string | null;
     expected_commit: string | null;
+    revision_state: "matching" | "mismatch" | "unresolved" | "unavailable" | string;
+    worktree_state: "clean" | "modified" | "unavailable" | string;
     pinned: boolean;
     sdk_version: string;
   };

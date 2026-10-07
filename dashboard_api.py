@@ -74,6 +74,8 @@ def build_dashboard_snapshot(*, database_path: str | Path | None = None) -> dict
             "status": dependencies["slai"]["status"],
             "commit": dependencies["slai"].get("actual_commit"),
             "expected_commit": dependencies["slai"].get("expected_commit"),
+            "revision_state": dependencies["slai"].get("revision_state", "unavailable"),
+            "worktree_state": dependencies["slai"].get("worktree_state", "unavailable"),
             "pinned": dependencies["slai"].get("pinned", False),
             "selected_agents": selected_agents,
             "runtime_measurements": measurements,
@@ -84,6 +86,8 @@ def build_dashboard_snapshot(*, database_path: str | Path | None = None) -> dict
             "status": dependencies["harnyx"]["status"],
             "commit": dependencies["harnyx"].get("actual_commit"),
             "expected_commit": dependencies["harnyx"].get("expected_commit"),
+            "revision_state": dependencies["harnyx"].get("revision_state", "unavailable"),
+            "worktree_state": dependencies["harnyx"].get("worktree_state", "unavailable"),
             "pinned": dependencies["harnyx"].get("pinned", False),
             "sdk_version": str(
                 (external.get("harnyx") or {}).get("sdk_version")
@@ -147,6 +151,8 @@ def _dependency_snapshot(
             "status": "unavailable",
             "expected_commit": str(settings.get("expected_commit") or "") if isinstance(settings, Mapping) else "",
             "actual_commit": None,
+            "revision_state": "unavailable",
+            "worktree_state": "unavailable",
             "pinned": False,
         }
     fallback["miner"] = {"status": "unavailable", "actual_commit": None, "pinned": False}
