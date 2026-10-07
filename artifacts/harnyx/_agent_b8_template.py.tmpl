@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
+
+from dataclasses import dataclass, field
+from enum import Enum
 
 from harnyx_miner_sdk.api import fetch_page, llm_chat, search_web, tooling_info
 from harnyx_miner_sdk.context import ContextSnapshot
@@ -12,6 +16,8 @@ from harnyx_miner_sdk.structured_output import validate_output_against_schema
 
 
 PROFILE = __PROFILE_JSON__
+
+__SLAI_RESEARCH_RUNTIME__
 
 _MARKER = re.compile(r"\[\[(\d+)\]\]")
 _WORD = re.compile(r"[a-z0-9]{3,}")
@@ -26,15 +32,31 @@ _DATE = re.compile(
 )
 
 _MAX_SEARCH_QUERIES = 3
-_MAX_FETCH_PAGES = 3
+_MAX_FETCH_PAGES = 4
 _MAX_PAGE_CHARS = 10000
-_MAX_TOTAL_EVIDENCE_CHARS = 22000
+_MAX_TOTAL_EVIDENCE_CHARS = 26000
+
+# Keep our own evidence ceiling well below Harnyx's hard 120k materialized
+# citation-text cap. Prompt evidence and citation hydration are different
+# budgets: an evidence excerpt may be only 2k characters while an unsliced
+# citation can materialize a 50k+ provider result.
+_MAX_MATERIALIZED_CITATION_CHARS = 80000
+_MAX_GENERAL_CITATION_CHARS_PER_REF = 7200
+_MAX_GENERAL_CITATION_SLICES = 3
 
 # Harnyx validator contract: any explicit citation slice must contain at least
 # 100 characters unless the complete source text itself is shorter.
 _MIN_CITATION_SLICE_CHARS = 100
 _TARGET_CITATION_SLICE_CHARS = 260
+_GENERAL_CITATION_WINDOW_CHARS = 2200
 _MAX_COMPARISON_CITATION_SLICES = 6
+
+# The operator has a working Chutes credential and B8's canonical model is on
+# Chutes. Tooling availability does not guarantee provider credentials, so
+# credentialed Chutes routes are preferred over speculative cross-provider
+# routes. Failed credential providers are not retried repeatedly in one task.
+_LLM_PROVIDER_PREFERENCE = ("chutes", "openrouter", "ai_gateway")
+_DEAD_LLM_PROVIDERS = set()
 
 _SEARCH_FALLBACKS = (
     "exa",
@@ -507,6 +529,10 @@ def _task_policy(query: Query):
         )
     )
 
+    # correctness-v1 benchmark tasks are delivered with query.fast=True.
+    # "fast" is a latency hint, not permission to answer factual research
+    # questions from model memory. B8 therefore keeps the planning depth small
+    # for fast queries but still retrieves evidence by default.
     if query.fast:
         depth = "lightweight"
     elif comparative or uncertain or document_heavy:
@@ -518,13 +544,7 @@ def _task_policy(query: Query):
 
     needs_retrieval = bool(
         PROFILE["retrieval"]
-        and (
-            temporal
-            or evidentiary
-            or comparative
-            or document_heavy
-            or depth == "deep"
-        )
+        and bool(text)
     )
 
     return {
@@ -554,7 +574,10 @@ def _task_policy(query: Query):
         "fetch_pages": (
             _MAX_FETCH_PAGES
             if depth == "deep"
-            else min(2, _MAX_FETCH_PAGES)
+            else min(
+                3 if needs_retrieval else 2,
+                _MAX_FETCH_PAGES,
+            )
         ),
     }
 
@@ -923,8 +946,25 @@ def _bounded_timeout(
     )
 
 
+def _provider_preference_index(provider: str) -> int:
+    try:
+        return _LLM_PROVIDER_PREFERENCE.index(provider)
+    except ValueError:
+        return len(_LLM_PROVIDER_PREFERENCE)
+
+
 async def _route():
-    default = PROFILE["routes"][0]
+    routes = sorted(
+        PROFILE["routes"],
+        key=lambda item: (
+            _provider_preference_index(
+                item["provider"],
+            ),
+            PROFILE["routes"].index(item),
+        ),
+    )
+
+    default = routes[0]
 
     if not PROFILE["provider_routing"]:
         return default
@@ -939,9 +979,14 @@ async def _route():
         or {}
     )
 
-    for route in PROFILE["routes"]:
+    for route in routes:
+        provider = route["provider"]
+
+        if provider in _DEAD_LLM_PROVIDERS:
+            continue
+
         if route["model"] in (
-            allowed.get(route["provider"])
+            allowed.get(provider)
             or []
         ):
             return route
@@ -959,7 +1004,38 @@ def _llm_route_order(route):
         if candidate not in routes:
             routes.append(candidate)
 
-    return routes
+    routes.sort(
+        key=lambda item: (
+            item["provider"] in _DEAD_LLM_PROVIDERS,
+            _provider_preference_index(
+                item["provider"],
+            ),
+            0 if item == route else 1,
+        )
+    )
+
+    return [
+        candidate
+        for candidate in routes
+        if candidate["provider"] not in _DEAD_LLM_PROVIDERS
+    ]
+
+
+def _credential_failure(exc: Exception) -> bool:
+    message = str(exc).lower()
+
+    return any(
+        token in message
+        for token in (
+            "credential unavailable",
+            "provider credential unavailable",
+            "missing credential",
+            "api key",
+            "unauthorized",
+            "authentication",
+        )
+    )
+
 
 
 async def _chat(
@@ -967,11 +1043,23 @@ async def _chat(
     prompt: str,
     tokens: int,
     timeout: float,
+    runtime=None,
 ):
     for candidate in _llm_route_order(route)[:3]:
+        provider = candidate["provider"]
+
+        if runtime is not None and not runtime.provider_usable(provider):
+            continue
+
+        if runtime is not None and not runtime.budget.can_llm():
+            break
+
         try:
+            if runtime is not None:
+                runtime.record_llm()
+
             result = await llm_chat(
-                provider=candidate["provider"],
+                provider=provider,
                 model=candidate["model"],
                 messages=[
                     {
@@ -990,16 +1078,32 @@ async def _chat(
                 ),
             )
 
+            if runtime is not None:
+                runtime.mark_provider(
+                    provider,
+                    success=True,
+                )
+                runtime.update_remaining_cost(
+                    result.budget.session_remaining_budget_usd
+                )
+
             return (
                 (result.llm.raw_text or "").strip(),
                 result.budget.session_remaining_budget_usd,
             )
 
-        except Exception:
+        except Exception as exc:
+            if runtime is not None:
+                runtime.mark_provider(
+                    provider,
+                    error=str(exc),
+                )
+
+            if _credential_failure(exc):
+                _DEAD_LLM_PROVIDERS.add(provider)
             continue
 
     return "", None
-
 
 def _fallback_queries(text: str):
     normalized = _normalize(text)
@@ -1098,6 +1202,7 @@ def _parse_research_plan(
     )
 
 
+
 async def _research_plan(
     query: Query,
     route,
@@ -1105,6 +1210,7 @@ async def _research_plan(
     remaining: float,
     started: float,
     time_limit_seconds: float,
+    runtime=None,
 ):
     anchored = _anchored_queries(query.text)
 
@@ -1115,9 +1221,35 @@ async def _research_plan(
             remaining,
         )
 
+    deterministic_queries = []
+    if runtime is not None:
+        deterministic_queries = list(
+            runtime.planning_snapshot().initial_queries
+        )
+
     if not policy["needs_plan"]:
         return (
-            _fallback_queries(query.text),
+            (
+                deterministic_queries
+                or _fallback_queries(query.text)
+            )[:_MAX_SEARCH_QUERIES],
+            "",
+            remaining,
+        )
+
+    should_use_llm_plan = bool(
+        runtime is not None
+        and runtime.depth == ResearchDepth.DEEP
+        and runtime.profile.high_uncertainty
+        and runtime.budget.can_llm()
+    )
+
+    if not should_use_llm_plan:
+        return (
+            (
+                deterministic_queries
+                or _fallback_queries(query.text)
+            )[:_MAX_SEARCH_QUERIES],
             "",
             remaining,
         )
@@ -1128,10 +1260,9 @@ async def _research_plan(
         '{"queries":["search query 1","search query 2"],'
         '"checks":["factual check 1","factual check 2"]}. '
         "Use at most 3 search queries and at most 4 factual checks. "
-        "Search queries should target the exact primary documents, organizations, "
-        "dates, versions, tables, reports, standards, datasets, or records needed. "
-        "For comparison questions, create queries that can locate each side of "
-        "the comparison separately. Do not answer the question.\n\n"
+        "Search queries should target exact primary documents, organizations, "
+        "dates, versions, tables, reports, standards, datasets, or records. "
+        "For comparisons, locate each side separately. Do not answer.\n\n"
         "QUESTION:\n"
         + query.text
     )
@@ -1145,6 +1276,7 @@ async def _research_plan(
             time_limit_seconds,
             PROFILE["minimum_final_seconds"],
         ),
+        runtime=runtime,
     )
 
     if updated is not None:
@@ -1155,7 +1287,19 @@ async def _research_plan(
         query.text,
     )
 
-    return queries, checks, remaining
+    combined = []
+    for candidate in (
+        *deterministic_queries,
+        *queries,
+    ):
+        if candidate and candidate not in combined:
+            combined.append(candidate)
+
+    return (
+        combined[:_MAX_SEARCH_QUERIES],
+        checks,
+        remaining,
+    )
 
 
 async def _search_with_failover(
@@ -1164,6 +1308,7 @@ async def _search_with_failover(
     remaining: float,
     started: float,
     time_limit_seconds: float,
+    runtime=None,
 ):
     if not queries:
         return None, None, remaining
@@ -1179,7 +1324,16 @@ async def _search_with_failover(
         ):
             break
 
+        if runtime is not None and not runtime.provider_usable(provider):
+            continue
+
+        if runtime is not None and not runtime.budget.can_search():
+            break
+
         try:
+            if runtime is not None:
+                runtime.record_search()
+
             result = await search_web(
                 queries,
                 provider=provider,
@@ -1195,16 +1349,28 @@ async def _search_with_failover(
                 result.budget.session_remaining_budget_usd
             )
 
+            if runtime is not None:
+                runtime.mark_provider(provider, success=True)
+                runtime.update_remaining_cost(remaining)
+
             if result.results:
                 filtered = _select_search_results(
                     result.results,
                     " ".join(queries),
-                    max(policy["evidence_limit"], policy["fetch_pages"]),
+                    max(
+                        policy["evidence_limit"],
+                        policy["fetch_pages"],
+                    ),
                 )
                 if filtered:
                     return result, provider, remaining
 
-        except Exception:
+        except Exception as exc:
+            if runtime is not None:
+                runtime.mark_provider(
+                    provider,
+                    error=str(exc),
+                )
             continue
 
     return None, None, remaining
@@ -1216,6 +1382,7 @@ async def _fetch_with_failover(
     remaining: float,
     started: float,
     time_limit_seconds: float,
+    runtime=None,
 ):
     for provider in _provider_order(
         preferred_provider,
@@ -1230,7 +1397,16 @@ async def _fetch_with_failover(
         ):
             break
 
+        if runtime is not None and not runtime.provider_usable(provider):
+            continue
+
+        if runtime is not None and not runtime.budget.can_fetch():
+            break
+
         try:
+            if runtime is not None:
+                runtime.record_fetch()
+
             page = await fetch_page(
                 url,
                 provider=provider,
@@ -1245,14 +1421,22 @@ async def _fetch_with_failover(
                 page.budget.session_remaining_budget_usd
             )
 
+            if runtime is not None:
+                runtime.mark_provider(provider, success=True)
+                runtime.update_remaining_cost(remaining)
+
             if page.response.data:
                 return page, provider, remaining
 
-        except Exception:
+        except Exception as exc:
+            if runtime is not None:
+                runtime.mark_provider(
+                    provider,
+                    error=str(exc),
+                )
             continue
 
     return None, None, remaining
-
 
 def _item_identity(item) -> str:
     return (
@@ -1272,6 +1456,7 @@ async def _search_exact_week(
     started: float,
     time_limit_seconds: float,
     preferred_domain: str | None = None,
+    runtime=None,
 ):
     search_query = _query_for_week(
         query.text,
@@ -1294,7 +1479,16 @@ async def _search_exact_week(
         ):
             break
 
+        if runtime is not None and not runtime.provider_usable(provider):
+            continue
+
+        if runtime is not None and not runtime.budget.can_search():
+            break
+
         try:
+            if runtime is not None:
+                runtime.record_search()
+
             search = await search_web(
                 search_query,
                 provider=provider,
@@ -1311,7 +1505,17 @@ async def _search_exact_week(
             remaining = (
                 search.budget.session_remaining_budget_usd
             )
-        except Exception:
+
+            if runtime is not None:
+                runtime.mark_provider(provider, success=True)
+                runtime.update_remaining_cost(remaining)
+
+        except Exception as exc:
+            if runtime is not None:
+                runtime.mark_provider(
+                    provider,
+                    error=str(exc),
+                )
             continue
 
         exact = [
@@ -1357,6 +1561,7 @@ async def _search_exact_week(
                 remaining,
                 started,
                 time_limit_seconds,
+                runtime=runtime,
             )
 
             if page is None or not page.response.data:
@@ -1396,6 +1601,17 @@ async def _search_exact_week(
             if reference is None:
                 continue
 
+            citation, citation_chars = _bounded_citation_ref(
+                receipt_id=page.receipt_id,
+                result_id=reference.result_id,
+                source_text=reference.note or "",
+                query_text=query.text,
+                preferred_text=content,
+            )
+
+            if citation is None:
+                continue
+
             return {
                 "week": week,
                 "title": datum.title or item.title or url,
@@ -1405,10 +1621,8 @@ async def _search_exact_week(
                 "citation_note": reference.note or "",
                 "receipt_id": page.receipt_id,
                 "result_id": reference.result_id,
-                "citation": CitationRef(
-                    receipt_id=page.receipt_id,
-                    result_id=reference.result_id,
-                ),
+                "citation": citation,
+                "citation_chars": citation_chars,
             }, remaining
 
     return None, remaining
@@ -1702,6 +1916,303 @@ def _deterministic_table_comparison(query_text: str, sources):
         )
 
     return "\n".join(lines)
+
+
+def _query_citation_terms(text: str):
+    stopwords = {
+        "about",
+        "after",
+        "again",
+        "against",
+        "also",
+        "among",
+        "and",
+        "are",
+        "because",
+        "been",
+        "before",
+        "being",
+        "between",
+        "both",
+        "but",
+        "can",
+        "could",
+        "does",
+        "each",
+        "for",
+        "from",
+        "have",
+        "into",
+        "its",
+        "most",
+        "not",
+        "only",
+        "other",
+        "over",
+        "same",
+        "should",
+        "than",
+        "that",
+        "the",
+        "their",
+        "then",
+        "there",
+        "these",
+        "they",
+        "this",
+        "those",
+        "through",
+        "under",
+        "using",
+        "was",
+        "were",
+        "what",
+        "when",
+        "where",
+        "which",
+        "while",
+        "who",
+        "with",
+        "would",
+    }
+
+    terms = []
+
+    for token in _WORD.findall(
+        (text or "").lower(),
+    ):
+        if (
+            len(token) < 4
+            or token in stopwords
+            or token in terms
+        ):
+            continue
+
+        terms.append(token)
+
+    return sorted(
+        terms,
+        key=lambda item: (-len(item), item),
+    )[:14]
+
+
+def _preferred_evidence_needles(text: str):
+    needles = []
+
+    for raw_line in (text or "").splitlines():
+        line = _normalize(raw_line)
+
+        if len(line) < 24:
+            continue
+
+        # Exact long lines often differ slightly between provider content and
+        # citation notes. Use a stable prefix and fall back to query terms.
+        needle = line[:120]
+
+        if needle not in needles:
+            needles.append(needle)
+
+        if len(needles) >= 4:
+            break
+
+    return needles
+
+
+def _window_around_index(
+    text: str,
+    index: int,
+    *,
+    target_chars: int = _GENERAL_CITATION_WINDOW_CHARS,
+):
+    if not text:
+        return None
+
+    source_length = len(text)
+
+    if source_length < _MIN_CITATION_SLICE_CHARS:
+        return None
+
+    target = max(
+        _MIN_CITATION_SLICE_CHARS,
+        min(
+            target_chars,
+            _MAX_GENERAL_CITATION_CHARS_PER_REF,
+        ),
+    )
+
+    start = max(
+        0,
+        index - target // 3,
+    )
+    end = min(
+        source_length,
+        start + target,
+    )
+
+    if end - start < target:
+        start = max(
+            0,
+            end - target,
+        )
+
+    if end - start < _MIN_CITATION_SLICE_CHARS:
+        return None
+
+    return CitationSlice(
+        start=start,
+        end=end,
+    )
+
+
+def _bounded_general_citation_slices(
+    source_text: str,
+    query_text: str,
+    preferred_text: str = "",
+):
+    source = source_text or ""
+
+    if len(source) < _MIN_CITATION_SLICE_CHARS:
+        return []
+
+    lower = source.lower()
+    slices = []
+
+    for needle in _preferred_evidence_needles(
+        preferred_text,
+    ):
+        index = lower.find(
+            needle.lower(),
+        )
+
+        if index < 0:
+            continue
+
+        segment = _window_around_index(
+            source,
+            index,
+        )
+
+        if segment is not None:
+            slices.append(segment)
+
+        if len(slices) >= _MAX_GENERAL_CITATION_SLICES:
+            break
+
+    if len(slices) < _MAX_GENERAL_CITATION_SLICES:
+        for term in _query_citation_terms(
+            query_text,
+        ):
+            index = lower.find(term)
+
+            if index < 0:
+                continue
+
+            segment = _window_around_index(
+                source,
+                index,
+            )
+
+            if segment is not None:
+                slices.append(segment)
+
+            if len(slices) >= _MAX_GENERAL_CITATION_SLICES:
+                break
+
+    if not slices:
+        end = min(
+            len(source),
+            _MAX_GENERAL_CITATION_CHARS_PER_REF,
+        )
+
+        return [
+            CitationSlice(
+                start=0,
+                end=end,
+            )
+        ]
+
+    merged = _merge_citation_slices(
+        slices,
+    )
+
+    bounded = []
+    used = 0
+
+    for segment in merged:
+        remaining = (
+            _MAX_GENERAL_CITATION_CHARS_PER_REF
+            - used
+        )
+
+        if remaining < _MIN_CITATION_SLICE_CHARS:
+            break
+
+        end = min(
+            segment.end,
+            segment.start + remaining,
+        )
+
+        if end - segment.start < _MIN_CITATION_SLICE_CHARS:
+            continue
+
+        bounded.append(
+            CitationSlice(
+                start=segment.start,
+                end=end,
+            )
+        )
+        used += end - segment.start
+
+        if len(bounded) >= _MAX_GENERAL_CITATION_SLICES:
+            break
+
+    return bounded
+
+
+def _bounded_citation_ref(
+    *,
+    receipt_id,
+    result_id,
+    source_text: str,
+    query_text: str,
+    preferred_text: str = "",
+):
+    source = source_text or ""
+
+    if not source.strip():
+        return None, 0
+
+    if len(source) < _MIN_CITATION_SLICE_CHARS:
+        return (
+            CitationRef(
+                receipt_id=receipt_id,
+                result_id=result_id,
+            ),
+            len(source),
+        )
+
+    slices = _bounded_general_citation_slices(
+        source,
+        query_text,
+        preferred_text,
+    )
+
+    if not slices:
+        return None, 0
+
+    char_count = sum(
+        segment.end - segment.start
+        for segment in slices
+    )
+
+    return (
+        CitationRef(
+            receipt_id=receipt_id,
+            result_id=result_id,
+            slices=slices,
+        ),
+        char_count,
+    )
 
 
 def _comparison_block(evidence: str):
@@ -2159,6 +2670,288 @@ def _focused_page_content(text: str, query_text: str) -> str:
     return value
 
 
+
+def _schema_output_fields(query: Query):
+    schema = query.output_schema or {}
+    properties = schema.get("properties")
+
+    if not isinstance(properties, dict):
+        return ()
+
+    return tuple(
+        str(key)
+        for key in properties
+        if str(key).strip()
+    )
+
+
+def _runtime_relevance(query_text: str, evidence_text: str) -> float:
+    query_terms = set(
+        _query_citation_terms(query_text)
+    )
+    evidence_terms = set(
+        _query_citation_terms(evidence_text)
+    )
+
+    if not query_terms:
+        return 0.5
+
+    return min(
+        1.0,
+        len(query_terms & evidence_terms)
+        / max(1, len(query_terms)),
+    )
+
+
+def _runtime_ingest_evidence(
+    runtime,
+    evidence: str,
+    *,
+    retrieval_query: str,
+    provider: str = "harnyx",
+):
+    pattern = re.compile(
+        r"SOURCE\s+(\d+)\s+\[\[(\d+)\]\]\s+([^\n]*)\n"
+        r"(?:REPORT WEEK:[^\n]*\n)?"
+        r"URL:\s*(\S+)\n"
+        r"(.*?)(?=\n\nSOURCE\s+\d+\s+\[\[\d+\]\]|\Z)",
+        re.DOTALL,
+    )
+
+    for match in pattern.finditer(evidence or ""):
+        source_number = match.group(1)
+        title = _normalize(match.group(3))
+        url = match.group(4).strip()
+        excerpt = match.group(5).strip()
+
+        if not url or not excerpt:
+            continue
+
+        source_id = hashlib.sha256(
+            (
+                url.lower()
+                + "\n"
+                + title.lower()
+            ).encode("utf-8")
+        ).hexdigest()[:20]
+
+        runtime.add_evidence(
+            EvidenceRecord(
+                source_id=source_id,
+                url=url,
+                domain=_domain(url),
+                title=title,
+                retrieval_query=retrieval_query,
+                provider=provider,
+                excerpt=excerpt[:_MAX_PAGE_CHARS],
+                relevance=_runtime_relevance(
+                    runtime.task_text,
+                    title + "\n" + excerpt,
+                ),
+                temporal_match=(
+                    1.0
+                    if _candidate_matches_anchors(
+                        title + "\n" + url + "\n" + excerpt,
+                        runtime.task_text,
+                    )
+                    else 0.0
+                ),
+                citation_eligible=True,
+                source_text_length=len(excerpt),
+                provenance=[
+                    provider + ":source-" + source_number
+                ],
+            )
+        )
+
+
+def _citation_identity(citation):
+    return (
+        getattr(citation, "receipt_id", None),
+        getattr(citation, "result_id", None),
+    )
+
+
+def _merge_round_evidence(
+    evidence: str,
+    round_citations,
+    citations,
+    citation_indexes,
+):
+    local_to_global = {}
+
+    for local_index, citation in enumerate(
+        round_citations,
+        start=1,
+    ):
+        key = _citation_identity(citation)
+
+        if key in citation_indexes:
+            local_to_global[local_index] = citation_indexes[key]
+            continue
+
+        citations.append(citation)
+        global_index = len(citations)
+        citation_indexes[key] = global_index
+        local_to_global[local_index] = global_index
+
+    def replace_marker(match):
+        local = int(match.group(1))
+        global_index = local_to_global.get(local)
+
+        if global_index is None:
+            return ""
+
+        return "[[" + str(global_index) + "]]"
+
+    return _MARKER.sub(
+        replace_marker,
+        evidence or "",
+    )
+
+
+async def _runtime_research_loop(
+    query: Query,
+    initial_queries,
+    checks: str,
+    policy,
+    runtime,
+    remaining: float,
+    started: float,
+    time_limit_seconds: float,
+):
+    requested_weeks, _ = _temporal_anchors(query.text)
+
+    if len(requested_weeks) >= 2:
+        if not runtime.begin_round():
+            return "", [], remaining
+
+        evidence, citations, remaining = await _evidence(
+            query,
+            initial_queries,
+            checks,
+            policy,
+            remaining,
+            started,
+            time_limit_seconds,
+            runtime=runtime,
+        )
+
+        _runtime_ingest_evidence(
+            runtime,
+            evidence,
+            retrieval_query=" | ".join(initial_queries),
+        )
+        return evidence, citations, remaining
+
+    chunks = []
+    citations = []
+    citation_indexes = {}
+    round_queries = list(initial_queries)
+    follow_up = False
+
+    while round_queries and runtime.begin_round(
+        follow_up=follow_up,
+    ):
+        round_evidence, round_citations, remaining = await _evidence_fallback(
+            query,
+            round_queries,
+            checks,
+            policy,
+            remaining,
+            started,
+            time_limit_seconds,
+            runtime=runtime,
+        )
+
+        if round_evidence:
+            merged = _merge_round_evidence(
+                round_evidence,
+                round_citations,
+                citations,
+                citation_indexes,
+            )
+            chunks.append(merged)
+            _runtime_ingest_evidence(
+                runtime,
+                merged,
+                retrieval_query=" | ".join(round_queries),
+            )
+
+        decision = runtime.should_continue_research()
+
+        if not decision.continue_research:
+            break
+
+        round_queries = decision.follow_up_queries
+        follow_up = True
+
+    return (
+        "\n\n".join(chunks),
+        citations,
+        remaining,
+    )
+
+
+async def _runtime_targeted_repair(
+    query: Query,
+    repair_queries,
+    evidence: str,
+    citations,
+    checks: str,
+    policy,
+    runtime,
+    remaining: float,
+    started: float,
+    time_limit_seconds: float,
+):
+    if not repair_queries or not runtime.budget.can_search():
+        return evidence, citations, remaining
+
+    extra, extra_citations, remaining = await _evidence_fallback(
+        query,
+        repair_queries,
+        checks,
+        policy,
+        remaining,
+        started,
+        time_limit_seconds,
+        runtime=runtime,
+    )
+
+    if not extra:
+        return evidence, citations, remaining
+
+    citation_indexes = {
+        _citation_identity(citation): index
+        for index, citation in enumerate(
+            citations,
+            start=1,
+        )
+    }
+    merged = _merge_round_evidence(
+        extra,
+        extra_citations,
+        citations,
+        citation_indexes,
+    )
+    _runtime_ingest_evidence(
+        runtime,
+        merged,
+        retrieval_query=" | ".join(repair_queries),
+    )
+
+    return (
+        (
+            evidence + "\n\n" + merged
+            if evidence
+            else merged
+        ),
+        citations,
+        remaining,
+    )
+
+
 async def _evidence_fallback(
     query: Query,
     queries,
@@ -2167,6 +2960,7 @@ async def _evidence_fallback(
     remaining: float,
     started: float,
     time_limit_seconds: float,
+    runtime=None,
 ):
     if not policy["needs_retrieval"]:
         return "", [], remaining
@@ -2177,6 +2971,7 @@ async def _evidence_fallback(
         remaining,
         started,
         time_limit_seconds,
+        runtime=runtime,
     )
 
     if search is None:
@@ -2194,9 +2989,13 @@ async def _evidence_fallback(
     evidence_parts = []
     citations = []
     evidence_chars = 0
+    citation_chars = 0
 
     for item in candidates[: policy["fetch_pages"]]:
-        if evidence_chars >= _MAX_TOTAL_EVIDENCE_CHARS:
+        if (
+            evidence_chars >= _MAX_TOTAL_EVIDENCE_CHARS
+            or citation_chars >= _MAX_MATERIALIZED_CITATION_CHARS
+        ):
             break
 
         url = (item.url or "").strip()
@@ -2210,6 +3009,7 @@ async def _evidence_fallback(
             remaining,
             started,
             time_limit_seconds,
+            runtime=runtime,
         )
 
         if page is not None and page.response.data:
@@ -2223,7 +3023,10 @@ async def _evidence_fallback(
                 + datum.content[:2000]
             )
 
-            if not _candidate_matches_anchors(page_identity, query.text):
+            if not _candidate_matches_anchors(
+                page_identity,
+                query.text,
+            ):
                 continue
 
             content = _focused_page_content(
@@ -2239,57 +3042,91 @@ async def _evidence_fallback(
                 )
 
                 if reference is not None:
-                    citations.append(
-                        CitationRef(
-                            receipt_id=page.receipt_id,
-                            result_id=reference.result_id,
+                    citation, selected_chars = _bounded_citation_ref(
+                        receipt_id=page.receipt_id,
+                        result_id=reference.result_id,
+                        source_text=reference.note or "",
+                        query_text=query.text,
+                        preferred_text=content,
+                    )
+
+                    if (
+                        citation is not None
+                        and citation_chars + selected_chars
+                        <= _MAX_MATERIALIZED_CITATION_CHARS
+                    ):
+                        citations.append(citation)
+                        citation_chars += selected_chars
+                        if runtime is not None:
+                            runtime.record_citation_chars(selected_chars)
+
+                        marker = (
+                            "[["
+                            + str(len(citations))
+                            + "]]"
                         )
-                    )
+                        title = (
+                            datum.title
+                            or item.title
+                            or url
+                        )
 
-                    marker = "[[" + str(len(citations)) + "]]"
-                    title = (
-                        datum.title
-                        or item.title
-                        or url
-                    )
+                        allowance = max(
+                            0,
+                            _MAX_TOTAL_EVIDENCE_CHARS
+                            - evidence_chars,
+                        )
 
-                    allowance = max(
-                        0,
-                        _MAX_TOTAL_EVIDENCE_CHARS
-                        - evidence_chars,
-                    )
+                        content = content[:allowance]
 
-                    content = content[:allowance]
+                        evidence_parts.append(
+                            "SOURCE "
+                            + str(len(citations))
+                            + " "
+                            + marker
+                            + " "
+                            + _normalize(title)
+                            + "\nURL: "
+                            + url
+                            + "\n"
+                            + content
+                        )
 
-                    evidence_parts.append(
-                        "SOURCE "
-                        + str(len(citations))
-                        + " "
-                        + marker
-                        + " "
-                        + _normalize(title)
-                        + "\nURL: "
-                        + url
-                        + "\n"
-                        + content
-                    )
+                        evidence_chars += len(content)
+                        continue
 
-                    evidence_chars += len(content)
-                    continue
-
-        note = _normalize(item.note or "")
+        note = _normalize(
+            item.note or "",
+        )
 
         if not note:
             continue
 
-        citations.append(
-            CitationRef(
-                receipt_id=search.receipt_id,
-                result_id=item.result_id,
-            )
+        citation, selected_chars = _bounded_citation_ref(
+            receipt_id=search.receipt_id,
+            result_id=item.result_id,
+            source_text=item.note or "",
+            query_text=query.text,
+            preferred_text=note[:2400],
         )
 
-        marker = "[[" + str(len(citations)) + "]]"
+        if (
+            citation is None
+            or citation_chars + selected_chars
+            > _MAX_MATERIALIZED_CITATION_CHARS
+        ):
+            continue
+
+        citations.append(citation)
+        citation_chars += selected_chars
+        if runtime is not None:
+            runtime.record_citation_chars(selected_chars)
+
+        marker = (
+            "[["
+            + str(len(citations))
+            + "]]"
+        )
 
         evidence_parts.append(
             "SOURCE "
@@ -2311,20 +3148,37 @@ async def _evidence_fallback(
 
     if not evidence_parts:
         for item in candidates[: policy["evidence_limit"]]:
-            note = _normalize(item.note or "")
+            note = _normalize(
+                item.note or "",
+            )
             url = (item.url or "").strip()
 
             if not note or not url:
                 continue
 
-            citations.append(
-                CitationRef(
-                    receipt_id=search.receipt_id,
-                    result_id=item.result_id,
-                )
+            citation, selected_chars = _bounded_citation_ref(
+                receipt_id=search.receipt_id,
+                result_id=item.result_id,
+                source_text=item.note or "",
+                query_text=query.text,
+                preferred_text=note[:2400],
             )
 
-            marker = "[[" + str(len(citations)) + "]]"
+            if (
+                citation is None
+                or citation_chars + selected_chars
+                > _MAX_MATERIALIZED_CITATION_CHARS
+            ):
+                continue
+
+            citations.append(citation)
+            citation_chars += selected_chars
+
+            marker = (
+                "[["
+                + str(len(citations))
+                + "]]"
+            )
 
             evidence_parts.append(
                 "SOURCE "
@@ -2338,6 +3192,17 @@ async def _evidence_fallback(
                 + "\n"
                 + note[:2400]
             )
+
+            evidence_chars += min(
+                len(note),
+                2400,
+            )
+
+            if (
+                evidence_chars >= _MAX_TOTAL_EVIDENCE_CHARS
+                or citation_chars >= _MAX_MATERIALIZED_CITATION_CHARS
+            ):
+                break
 
     if checks:
         evidence_parts.insert(
@@ -2360,6 +3225,7 @@ async def _evidence(
     remaining: float,
     started: float,
     time_limit_seconds: float,
+    runtime=None,
 ):
     if not policy["needs_retrieval"]:
         return "", [], remaining
@@ -2382,6 +3248,7 @@ async def _evidence(
                 started,
                 time_limit_seconds,
                 preferred_domain=preferred_domain,
+                runtime=runtime,
             )
 
             if source is None:
@@ -2398,10 +3265,25 @@ async def _evidence(
             if preferred_domain is None:
                 preferred_domain = source.get("domain")
 
-        citations = [
-            source["citation"]
-            for source in sources
-        ]
+        citations = []
+        materialized_chars = 0
+
+        for source in sources:
+            selected_chars = int(
+                source.get("citation_chars")
+                or 0
+            )
+
+            if (
+                materialized_chars + selected_chars
+                > _MAX_MATERIALIZED_CITATION_CHARS
+            ):
+                continue
+
+            citations.append(
+                source["citation"],
+            )
+            materialized_chars += selected_chars
 
         parts = []
 
@@ -2454,6 +3336,7 @@ async def _evidence(
         remaining,
         started,
         time_limit_seconds,
+        runtime=runtime,
     )
 
 
@@ -2464,6 +3347,7 @@ async def _structured(
     remaining: float,
     started: float,
     time_limit_seconds: float,
+    runtime=None,
 ):
     schema = query.output_schema or {}
 
@@ -2517,6 +3401,7 @@ async def _structured(
             time_limit_seconds,
             PROFILE["minimum_final_seconds"],
         ),
+        runtime=runtime,
     )
 
     if updated is not None:
@@ -2551,6 +3436,7 @@ async def _verify(
     started: float,
     time_limit_seconds: float,
     minimum_budget_reserve_usd: float,
+    runtime=None,
 ):
     if not policy["needs_verification"]:
         return answer, remaining
@@ -2617,6 +3503,7 @@ async def _verify(
             time_limit_seconds,
             1.0,
         ),
+        runtime=runtime,
     )
 
     if updated is not None:
@@ -2652,21 +3539,38 @@ async def query(
     context: ContextSnapshot,
 ) -> Response:
     started = time.monotonic()
+    _DEAD_LLM_PROVIDERS.clear()
 
     remaining = (
         context.cost_budget.session_remaining_budget_usd
     )
-
     time_limit_seconds = (
         context.time_budget.limit_seconds
     )
-
     minimum_budget_reserve_usd = max(
         0.005,
         context.cost_budget.session_budget_usd
         * PROFILE["reserve_budget_fraction"],
     )
 
+    runtime = SLAIResearchRuntime(
+        query.text,
+        fast=query.fast,
+        structured_output=(
+            query.output_schema is not None
+        ),
+        output_fields=_schema_output_fields(query),
+        started=started,
+        time_limit_seconds=time_limit_seconds,
+        final_reserve_seconds=PROFILE["minimum_final_seconds"],
+        remaining_cost_usd=remaining,
+        minimum_cost_reserve_usd=minimum_budget_reserve_usd,
+        max_materialized_citation_chars=(
+            _MAX_MATERIALIZED_CITATION_CHARS
+        ),
+    )
+
+    runtime.analyze()
     policy = _task_policy(query)
     route = await _route()
 
@@ -2677,17 +3581,21 @@ async def query(
         remaining,
         started,
         time_limit_seconds,
+        runtime=runtime,
     )
+    runtime.update_remaining_cost(remaining)
 
-    evidence, citations, remaining = await _evidence(
+    evidence, citations, remaining = await _runtime_research_loop(
         query,
         search_queries,
         plan,
         policy,
+        runtime,
         remaining,
         started,
         time_limit_seconds,
     )
+    runtime.update_remaining_cost(remaining)
 
     deterministic_output = _deterministic_output_from_evidence(
         query,
@@ -2695,6 +3603,17 @@ async def query(
     )
 
     if deterministic_output is not None:
+        runtime.deterministic_solver_used = (
+            runtime.plan.deterministic_solver
+            or "deterministic_output"
+        )
+        runtime.verification_decision(
+            deterministic_output,
+            schema_valid=True,
+            citation_count=len(citations),
+            deterministic_consistent=True,
+        )
+
         return Response(
             output=deterministic_output,
             note=_comparison_note(
@@ -2723,10 +3642,12 @@ async def query(
             time_limit_seconds,
             1.0,
         ),
+        runtime=runtime,
     )
 
     if updated is not None:
         remaining = updated
+        runtime.update_remaining_cost(remaining)
 
     if query.output_schema is not None:
         output, remaining = await _structured(
@@ -2736,7 +3657,77 @@ async def query(
             remaining,
             started,
             time_limit_seconds,
+            runtime=runtime,
         )
+        runtime.update_remaining_cost(remaining)
+
+        schema_valid = True
+        try:
+            validate_output_against_schema(
+                output,
+                query.output_schema,
+            )
+        except (ValueError, TypeError):
+            schema_valid = False
+
+        decision = runtime.verification_decision(
+            output,
+            schema_valid=schema_valid,
+            citation_count=len(citations),
+        )
+
+        if (
+            decision.continue_research
+            and decision.follow_up_queries
+        ):
+            evidence, citations, remaining = await _runtime_targeted_repair(
+                query,
+                decision.follow_up_queries,
+                evidence,
+                citations,
+                plan,
+                policy,
+                runtime,
+                remaining,
+                started,
+                time_limit_seconds,
+            )
+
+            repaired_raw, updated = await _chat(
+                route,
+                _answer_prompt(
+                    query,
+                    evidence,
+                    plan,
+                    policy["needs_retrieval"],
+                ),
+                (
+                    PROFILE["fast_max_output_tokens"]
+                    if query.fast
+                    else PROFILE["normal_max_output_tokens"]
+                ),
+                _bounded_timeout(
+                    started,
+                    time_limit_seconds,
+                    1.0,
+                ),
+                runtime=runtime,
+            )
+
+            if updated is not None:
+                remaining = updated
+                runtime.update_remaining_cost(remaining)
+
+            if repaired_raw:
+                output, remaining = await _structured(
+                    query,
+                    route,
+                    repaired_raw,
+                    remaining,
+                    started,
+                    time_limit_seconds,
+                    runtime=runtime,
+                )
 
         output, remaining = await _verify(
             query,
@@ -2748,6 +3739,7 @@ async def query(
             started,
             time_limit_seconds,
             minimum_budget_reserve_usd,
+            runtime=runtime,
         )
 
         return Response(
@@ -2771,6 +3763,60 @@ async def query(
         len(citations),
     )
 
+    decision = runtime.verification_decision(
+        answer,
+        schema_valid=True,
+        citation_count=len(citations),
+    )
+
+    if (
+        decision.continue_research
+        and decision.follow_up_queries
+    ):
+        evidence, citations, remaining = await _runtime_targeted_repair(
+            query,
+            decision.follow_up_queries,
+            evidence,
+            citations,
+            plan,
+            policy,
+            runtime,
+            remaining,
+            started,
+            time_limit_seconds,
+        )
+
+        repaired, updated = await _chat(
+            route,
+            _answer_prompt(
+                query,
+                evidence,
+                plan,
+                policy["needs_retrieval"],
+            ),
+            (
+                PROFILE["fast_max_output_tokens"]
+                if query.fast
+                else PROFILE["normal_max_output_tokens"]
+            ),
+            _bounded_timeout(
+                started,
+                time_limit_seconds,
+                1.0,
+            ),
+            runtime=runtime,
+        )
+
+        if updated is not None:
+            remaining = updated
+            runtime.update_remaining_cost(remaining)
+
+        if repaired:
+            answer = _sanitize_markers(
+                repaired,
+                len(citations),
+            )
+
     answer, remaining = await _verify(
         query,
         route,
@@ -2781,6 +3827,7 @@ async def query(
         started,
         time_limit_seconds,
         minimum_budget_reserve_usd,
+        runtime=runtime,
     )
 
     answer = _sanitize_markers(

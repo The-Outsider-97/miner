@@ -10,7 +10,7 @@ from __future__ import annotations
 import time
 
 from dataclasses import asdict, dataclass
-from typing import Any, Mapping
+from typing import Any
 
 from .slai import SlaiRuntime
 from ..research.slai_research_runtime import SLAIResearchRuntime
