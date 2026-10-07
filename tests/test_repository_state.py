@@ -69,7 +69,7 @@ def _mock_dependency_git(
     )
 
 
-def test_matching_revision_is_ready_even_when_worktree_is_modified(
+def test_matching_revision_with_modified_worktree_remains_degraded(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -82,11 +82,33 @@ def test_matching_revision_is_ready_even_when_worktree_is_modified(
 
     status = dependency_status(_config(slai_expected="slai-pin"))
 
-    assert status["slai"]["status"] == "ready"
+    assert status["slai"]["status"] == "degraded"
     assert status["slai"]["revision_state"] == "matching"
     assert status["slai"]["revision_matches"] is True
     assert status["slai"]["worktree_state"] == "modified"
     assert status["slai"]["pinned"] is False
+
+
+
+
+
+def test_matching_clean_revision_is_ready(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    _mock_dependency_git(
+        monkeypatch,
+        tmp_path,
+        slai_actual="slai-pin",
+        slai_clean=True,
+    )
+
+    status = dependency_status(_config(slai_expected="slai-pin"))
+
+    assert status["slai"]["status"] == "ready"
+    assert status["slai"]["revision_state"] == "matching"
+    assert status["slai"]["worktree_state"] == "clean"
+    assert status["slai"]["pinned"] is True
 
 
 def test_actual_revision_mismatch_remains_degraded(
