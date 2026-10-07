@@ -81,15 +81,8 @@ def dependency_status(config: Mapping[str, Any] | None = None) -> dict[str, dict
 
         revision_state = _revision_state(expected, actual)
         revision_matches = revision_state == "matching"
-
-        # A matching commit is necessary but not sufficient for strict
-        # dependency health: tracked worktree changes can alter the code that is
-        # actually imported. Keep that reproducibility failure degraded, while
-        # reporting it separately from a genuine revision mismatch.
-        status = "ready" if revision_matches and clean else "degraded"
-
         result[name] = {
-            "status": status,
+            "status": "ready" if revision_matches and clean else "degraded",
             "path": str(root.relative_to(PROJECT_ROOT)),
             "expected_commit": expected,
             "actual_commit": actual,
