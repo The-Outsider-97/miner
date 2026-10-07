@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from miner.benchmark_store import BenchmarkStore
+import miner.dashboard_api as dashboard_api
 from miner.dashboard_api import _benchmark_snapshot, build_dashboard_snapshot
 
 
@@ -122,3 +123,80 @@ def test_corrupt_benchmark_store_is_frontend_safe(tmp_path: Path) -> None:
     assert snapshot["state"] == "unavailable"
     assert snapshot["latest"] is None
     assert snapshot["recent"] == []
+
+
+def _dependency_state(
+    *,
+    slai_status: str = "ready",
+    slai_revision_state: str = "matching",
+    slai_clean: bool = True,
+) -> dict:
+    return {
+        "slai": {
+            "status": slai_status,
+            "actual_commit": "slai-pin",
+            "expected_commit": "slai-pin",
+            "revision_state": slai_revision_state,
+            "worktree_state": "clean" if slai_clean else "modified",
+            "revision_matches": slai_revision_state == "matching",
+            "clean": slai_clean,
+            "pinned": slai_revision_state == "matching" and slai_clean,
+        },
+        "harnyx": {
+            "status": "ready",
+            "actual_commit": "harnyx-pin",
+            "expected_commit": "harnyx-pin",
+            "revision_state": "matching",
+            "worktree_state": "clean",
+            "revision_matches": True,
+            "clean": True,
+            "pinned": True,
+        },
+        "miner": {
+            "status": "ready",
+            "actual_commit": "miner-head",
+            "clean": True,
+        },
+    }
+
+
+def test_healthy_slai_without_runtime_use_does_not_degrade_backend(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        dashboard_api,
+        "dependency_status",
+        lambda config: _dependency_state(slai_clean=False),
+    )
+
+    snapshot = build_dashboard_snapshot(database_path=tmp_path / "missing.sqlite3")
+
+    assert snapshot["backend"]["status"] == "ready"
+    assert snapshot["slai"]["status"] == "ready"
+    assert snapshot["slai"]["revision_state"] == "matching"
+    assert snapshot["slai"]["worktree_state"] == "modified"
+    assert snapshot["slai"]["pinned"] is False
+    assert snapshot["slai"]["runtime_evidence"] == "not_recorded"
+    assert snapshot["slai"]["selected_agents"] == []
+    assert snapshot["slai"]["runtime_measurements"] == []
+
+
+def test_real_slai_revision_mismatch_degrades_backend(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        dashboard_api,
+        "dependency_status",
+        lambda config: _dependency_state(
+            slai_status="degraded",
+            slai_revision_state="mismatch",
+        ),
+    )
+
+    snapshot = build_dashboard_snapshot(database_path=tmp_path / "missing.sqlite3")
+
+    assert snapshot["backend"]["status"] == "degraded"
+    assert snapshot["slai"]["status"] == "degraded"
+    assert snapshot["slai"]["revision_state"] == "mismatch"
