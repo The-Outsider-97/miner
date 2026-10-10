@@ -122,7 +122,14 @@ export async function GET() {
       runMinerJson<MiningResponse>(
         "miner.mining_status_api",
         ["--json"],
-      ).catch(() => unknownMiningState),
+      ).catch((error: unknown) => {
+        console.error(
+          "[Miner Dashboard] Mining status backend failed:",
+          error instanceof Error ? error.message : "Unknown error",
+        );
+
+        return unknownMiningState;
+      }),
     ]);
 
     if (data.schema !== "slai-miner-dashboard-v1") {
