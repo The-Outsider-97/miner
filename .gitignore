@@ -45,6 +45,10 @@ local-eval-debug.log
 .harnyx-local-benchmark-progress/
 .harnyx-local-eval-failures/
 
+# Runtime state written by the Miner (market-price cache, submission ledger, locks)
+state/*
+!state/.gitkeep
+
 # Local experiment evidence can contain task text, retrieved pages and provider output
 benchmarks/harnyx/results/
 benchmarks/harnyx/manifests/*.json
